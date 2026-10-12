@@ -41,6 +41,7 @@ DRIFT_API_KEY = os.getenv("DRIFT_API_KEY", "drift")
 
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "300"))
+MODEL_REFRESH_INTERVAL = int(os.getenv("MODEL_REFRESH_INTERVAL", "21600"))  # 6 hours
 
 ADMIN_IDS = []
 admin_ids_str = os.getenv("ADMIN_IDS", "")
@@ -62,12 +63,12 @@ for i in range(1, 10):
             "id": channel_id
         })
 
-# Default force-join channels (used if no env vars are set)
 if not REQUIRED_CHANNELS:
     REQUIRED_CHANNELS = [
         {"username": "NCK_Dev", "link": "https://t.me/NCK_Dev", "id": "-1002583286874"},
         {"username": "ERRORX404E", "link": "https://t.me/ERRORX404E", "id": "-1004384280494"},
         {"username": "NCKDEVFreeSC", "link": "https://t.me/NCKDEVFreeSC", "id": "-1003637300526"},
+        {"username": "NEXUSAII", "link": "https://t.me/NEXUSAII", "id": "-1004447376177"},
     ]
 
 VERIFICATION_HOURS = int(os.getenv("VERIFICATION_HOURS", "1"))
@@ -356,7 +357,7 @@ class DriftAPI:
         return model_type in self.available_models
 
 # ============================================================================
-# GROQ AI CLASS WITH DRIFT INTEGRATION & FALLBACK
+# GROQ AI CLASS WITH AUTO-UPDATING MODELS
 # ============================================================================
 class GroqAI:
     def __init__(self):
@@ -364,39 +365,83 @@ class GroqAI:
         
         self.api_key = GROQ_API_KEY
         self.api_url = "https://api.groq.com/openai/v1/chat/completions"
+        self.models_url = "https://api.groq.com/openai/v1/models"
         
         self.drift = DriftAPI(DRIFT_API_URL, DRIFT_API_KEY)
         
         self.groq_limit_reached = False
         self.groq_limit_reset_time = None
         
-        self.base_models = {
-            "llama-3.3-70b": {
-                "name": "Llama 3.3 70B",
-                "model": "llama-3.3-70b-versatile",
+        # Known chat models metadata (used to enrich API-fetched models)
+        self.known_chat_models = {
+            "openai/gpt-oss-120b": {
+                "name": "GPT-OSS 120B",
                 "description": "🧠 Most Powerful",
                 "speed": "⚡ Fast",
-                "context": "📏 128K",
+                "context": "📏 131K",
                 "provider": "Groq"
             },
-            "llama-3.1-8b": {
-                "name": "Llama 3.1 8B",
-                "model": "llama-3.1-8b-instant",
+            "openai/gpt-oss-20b": {
+                "name": "GPT-OSS 20B",
                 "description": "🚀 Fastest",
                 "speed": "⚡ Ultra Fast",
-                "context": "📏 128K",
+                "context": "📏 131K",
                 "provider": "Groq"
             },
-            "mixtral-8x7b": {
-                "name": "Mixtral 8x7B",
-                "model": "mixtral-8x7b-32768",
-                "description": "⚖️ Balanced",
-                "speed": "⚡ Medium",
-                "context": "📏 32K",
+            "openai/gpt-oss-safeguard-20b": {
+                "name": "GPT-OSS Safeguard 20B",
+                "description": "🛡️ Safe Mode",
+                "speed": "⚡ Fast",
+                "context": "📏 131K",
                 "provider": "Groq"
-            }
+            },
+            "qwen/qwen3.6-27b": {
+                "name": "Qwen 3.6 27B",
+                "description": "⚖️ Balanced",
+                "speed": "⚡ Fast",
+                "context": "📏 131K",
+                "provider": "Groq"
+            },
+            "meta-llama/llama-4-scout-17b-16e-instruct": {
+                "name": "Llama 4 Scout 17B",
+                "description": "🎯 Instruction Tuned",
+                "speed": "⚡ Fast",
+                "context": "📏 131K",
+                "provider": "Groq"
+            },
+            "meta-llama/llama-4-maverick-17b-128e-instruct": {
+                "name": "Llama 4 Maverick 17B",
+                "description": "🚀 High Performance",
+                "speed": "⚡ Fast",
+                "context": "📏 131K",
+                "provider": "Groq"
+            },
         }
         
+        # Fallback base_models (used only if API fetch fails)
+        self.base_models = {
+            "gpt-oss-20b": {
+                "name": "GPT-OSS 20B",
+                "model": "openai/gpt-oss-20b",
+                "description": "🚀 Fastest",
+                "speed": "⚡ Ultra Fast",
+                "context": "📏 131K",
+                "provider": "Groq"
+            },
+            "gpt-oss-120b": {
+                "name": "GPT-OSS 120B",
+                "model": "openai/gpt-oss-120b",
+                "description": "🧠 Most Powerful",
+                "speed": "⚡ Fast",
+                "context": "📏 131K",
+                "provider": "Groq"
+            },
+        }
+        
+        # Try to fetch live models on startup
+        self.fetch_available_models()
+        
+        # Drift models (DeepSeek and GPT)
         self.drift_models = {}
         if self.drift.is_available("deepseek"):
             self.drift_models["deepseek"] = {
@@ -409,8 +454,8 @@ class GroqAI:
             }
         
         if self.drift.is_available("gpt-oss"):
-            self.drift_models["gpt-oss"] = {
-                "name": "GPT-OSS 120B",
+            self.drift_models["drift-gpt-oss"] = {
+                "name": "Drift GPT-OSS 120B",
                 "model": "gpt-oss",
                 "description": "💡 Creative & Analytical",
                 "speed": "⚡ Fast",
@@ -419,7 +464,12 @@ class GroqAI:
             }
         
         self.models = {**self.base_models, **self.drift_models}
-        self.current_model = "llama-3.1-8b"
+        
+        # Set initial model (pick first available)
+        if self.base_models:
+            self.current_model = list(self.base_models.keys())[0]
+        else:
+            self.current_model = "gpt-oss-20b"
         
         self.user_sessions = {}
         self.verified_users = {}
@@ -429,9 +479,67 @@ class GroqAI:
         self.user_ratings = defaultdict(list)
         self.last_response = {}
         self.model_stats = defaultdict(int)
+        self.last_model_refresh = datetime.now()
         
         logger.info(f"✅ Groq AI ready with {len(self.models)} models!")
         logger.info(f"📋 Available models: {list(self.models.keys())}")
+    
+    def fetch_available_models(self) -> bool:
+        """Fetch the current list of models from Groq and rebuild base_models."""
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        try:
+            logger.info("🔄 Fetching available models from Groq API...")
+            resp = requests.get(self.models_url, headers=headers, timeout=10)
+            
+            if resp.status_code != 200:
+                logger.warning(f"⚠️ Model fetch failed: {resp.status_code} - {resp.text[:200]}")
+                return False
+            
+            data = resp.json()
+            model_list = data.get("data", [])
+            if not model_list:
+                logger.warning("⚠️ Model fetch returned empty list")
+                return False
+            
+            logger.info(f"📥 Groq returned {len(model_list)} models")
+            
+            # Filter to only chat-capable models we have metadata for
+            new_base = {}
+            for m in model_list:
+                mid = m.get("id", "")
+                if mid in self.known_chat_models:
+                    info = self.known_chat_models[mid].copy()
+                    info["model"] = mid
+                    short_key = mid.split("/")[-1]
+                    new_base[short_key] = info
+            
+            if new_base:
+                self.base_models = new_base
+                self.last_model_refresh = datetime.now()
+                
+                # Rebuild combined models dict
+                self.models = {**self.base_models, **self.drift_models}
+                
+                # If current_model is no longer available, switch to first available
+                if self.current_model not in self.models:
+                    self.current_model = list(self.base_models.keys())[0]
+                    logger.info(f"🔄 Current model was removed, switched to: {self.current_model}")
+                
+                logger.info(f"✅ Auto-updated Groq models: {list(new_base.keys())}")
+                return True
+            else:
+                logger.warning(f"⚠️ No known chat models found. Available IDs: {[m.get('id') for m in model_list[:20]]}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Model fetch error: {e}")
+            import traceback
+            logger.error(f"❌ Traceback: {traceback.format_exc()}")
+            return False
     
     def _call_groq_api(self, messages: List[dict]) -> Tuple[str, bool]:
         """Call Groq API directly using requests"""
@@ -447,29 +555,19 @@ class GroqAI:
             "top_p": 0.9
         }
         
-        # ============ DEBUG: Log request info ============
-        logger.info(f"🔵 [GROQ DEBUG] ========== API CALL START ==========")
-        logger.info(f"🔵 [GROQ DEBUG] URL: {self.api_url}")
-        logger.info(f"🔵 [GROQ DEBUG] Model key: {self.current_model}")
-        logger.info(f"🔵 [GROQ DEBUG] Model ID: {self.models[self.current_model]['model']}")
-        logger.info(f"🔵 [GROQ DEBUG] API key (first 10 chars): {self.api_key[:10]}...")
-        logger.info(f"🔵 [GROQ DEBUG] API key length: {len(self.api_key)}")
-        logger.info(f"🔵 [GROQ DEBUG] Messages count: {len(messages)}")
-        logger.info(f"🔵 [GROQ DEBUG] Request payload: {json.dumps(data)[:500]}")
-        # =================================================
+        logger.info(f"🔵 [GROQ DEBUG] API CALL START - Model: {self.models[self.current_model]['model']}")
         
         try:
             response = requests.post(self.api_url, headers=headers, json=data, timeout=60)
             
-            # ============ DEBUG: Log response info ============
-            logger.info(f"🟢 [GROQ DEBUG] Response status: {response.status_code}")
-            logger.info(f"🟢 [GROQ DEBUG] Response headers: {dict(response.headers)}")
-            logger.info(f"🟢 [GROQ DEBUG] Response body (first 1000 chars): {response.text[:1000]}")
-            logger.info(f"🟢 [GROQ DEBUG] ========== API CALL END ==========")
-            # ===================================================
+            logger.info(f"🟢 [GROQ DEBUG] Status: {response.status_code} | Body: {response.text[:300]}")
             
             if response.status_code == 200:
                 return response.json()["choices"][0]["message"]["content"], False
+            elif response.status_code == 404:
+                logger.warning(f"⚠️ Model {self.models[self.current_model]['model']} not found. Refreshing...")
+                self.fetch_available_models()
+                return "🔄 <b>Model Updated</b>\n\nThe AI model was updated. Please try again.", False
             elif response.status_code == 429:
                 error_msg = response.text.lower()
                 if "quota" in error_msg or "daily" in error_msg:
@@ -487,15 +585,13 @@ class GroqAI:
                 return "❌ <b>Something went wrong</b>\n\nPlease try again later.", False
                 
         except requests.exceptions.Timeout:
-            logger.error(f"🔴 [GROQ DEBUG] Request TIMEOUT after 60 seconds")
+            logger.error(f"🔴 [GROQ DEBUG] TIMEOUT")
             return "⏰ <b>Timeout</b>\n\nThe AI service is taking too long.", False
         except requests.exceptions.ConnectionError as e:
             logger.error(f"🔴 [GROQ DEBUG] CONNECTION ERROR: {e}")
             return "❌ <b>Error</b>\n\nSomething went wrong.", False
         except Exception as e:
-            logger.error(f"🔴 [GROQ DEBUG] GENERAL EXCEPTION: {type(e).__name__}: {e}")
-            import traceback
-            logger.error(f"🔴 [GROQ DEBUG] Traceback: {traceback.format_exc()}")
+            logger.error(f"🔴 [GROQ DEBUG] EXCEPTION: {type(e).__name__}: {e}")
             return "❌ <b>Error</b>\n\nSomething went wrong.", False
     
     def chat(self, prompt: str, user_id: int) -> str:
@@ -505,7 +601,7 @@ class GroqAI:
         
         history = self.user_sessions[user_id]
         
-        current_model_info = self.models[self.current_model]
+        current_model_info = self.models.get(self.current_model, {})
         is_drift_model = current_model_info.get("provider") == "Drift AI"
         
         if is_drift_model:
@@ -649,6 +745,18 @@ FORMATTING RULES:
 ai = GroqAI()
 
 # ============================================================================
+# MODEL REFRESH BACKGROUND JOB
+# ============================================================================
+async def refresh_groq_models(context: ContextTypes.DEFAULT_TYPE):
+    """Background job to refresh model list periodically."""
+    logger.info("🔄 [AUTO-REFRESH] Refreshing Groq model list...")
+    success = ai.fetch_available_models()
+    if success:
+        logger.info(f"✅ [AUTO-REFRESH] Models refreshed. Current: {list(ai.base_models.keys())}")
+    else:
+        logger.warning("⚠️ [AUTO-REFRESH] Model refresh failed, keeping previous list")
+
+# ============================================================================
 # USER MANAGEMENT
 # ============================================================================
 async def get_all_users() -> List[int]:
@@ -678,7 +786,6 @@ async def check_user_subscription(user_id: int, context: ContextTypes.DEFAULT_TY
         channel_id = channel.get("id")
         joined = False
         
-        # Try by ID first (more reliable for private channels)
         if channel_id:
             try:
                 chat_member = await context.bot.get_chat_member(
@@ -687,10 +794,9 @@ async def check_user_subscription(user_id: int, context: ContextTypes.DEFAULT_TY
                 )
                 if chat_member.status in ["member", "administrator", "creator"]:
                     joined = True
-            except Exception as e:
-                logger.debug(f"Channel ID check failed for {channel_id}: {e}")
+            except Exception:
+                pass
         
-        # Fallback to username
         if not joined:
             try:
                 chat_member = await context.bot.get_chat_member(
@@ -699,8 +805,8 @@ async def check_user_subscription(user_id: int, context: ContextTypes.DEFAULT_TY
                 )
                 if chat_member.status in ["member", "administrator", "creator"]:
                     joined = True
-            except Exception as e:
-                logger.debug(f"Channel username check failed for {username}: {e}")
+            except Exception:
+                pass
         
         if not joined:
             not_joined.append(channel)
@@ -896,6 +1002,20 @@ async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")]])
         )
+    elif cmd == 'refresh':
+        await update.message.reply_text("🔄 Refreshing models...", parse_mode="HTML")
+        success = ai.fetch_available_models()
+        if success:
+            await update.message.reply_text(
+                f"✅ <b>Models Refreshed</b>\n\n"
+                f"📋 Available: {', '.join(ai.base_models.keys())}",
+                parse_mode="HTML"
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️ <b>Refresh Failed</b>\n\nCould not fetch models from Groq.",
+                parse_mode="HTML"
+            )
 
 # ============================================================================
 # CALLBACK HANDLER
@@ -1076,9 +1196,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Send any text message for intelligent responses\n\n"
             f"🔧 <b>Model Selection</b>\n"
             f"Choose from multiple AI models:\n"
-            f"• Groq Llama models\n"
+            f"• Groq GPT-OSS models\n"
             f"• DeepSeek V3.1\n"
-            f"• GPT-OSS 120B\n\n"
+            f"• Drift GPT-OSS\n\n"
             f"📚 <b>History</b>\n"
             f"View and clear your conversation history\n\n"
             f"⚡ <b>Powered by Groq & Drift AI</b>\n"
@@ -1108,9 +1228,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
                 [InlineKeyboardButton("👥 Users", callback_data="admin_users")],
                 [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
+                [InlineKeyboardButton("🔄 Refresh Models", callback_data="admin_refresh")],
                 [InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]
             ])
         )
+        return
+    
+    # Handle admin refresh
+    if data == "admin_refresh":
+        if not is_admin(user_id):
+            return
+        await query.edit_message_text("🔄 Refreshing models...", parse_mode="HTML")
+        success = ai.fetch_available_models()
+        if success:
+            await query.edit_message_text(
+                f"✅ <b>Models Refreshed</b>\n\n"
+                f"📋 Available: {', '.join(ai.base_models.keys())}",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]])
+            )
+        else:
+            await query.edit_message_text(
+                "⚠️ <b>Refresh Failed</b>\n\nCould not fetch models from Groq.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]])
+            )
         return
     
     # Handle admin stats
@@ -1137,6 +1279,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🤖 Current Model: {ai.models[ai.current_model]['name']}\n"
             f"📊 Model Usage:\n{model_usage}\n"
             f"💓 Keep-Alive: {'✅ Active' if RENDER_EXTERNAL_URL else '❌ Disabled'}\n"
+            f"🔄 Last Model Refresh: {ai.last_model_refresh.strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]])
@@ -1418,7 +1561,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     logger.info("🚀 Starting Nexus AI Bot with HTML formatting...")
     logger.info(f"📡 Health server: port {os.getenv('PORT', 10000)}")
-    logger.info(f"💓 Keep-alive: {'✅ Enabled' if RENDER_EXTERNAL_URL else '❌ Disabled (set RENDER_EXTERNAL_URL)'}")
+    logger.info(f"💓 Keep-alive: {'✅ Enabled' if RENDER_EXTERNAL_URL else '❌ Disabled'}")
     logger.info(f"📢 Force join channels: {[c['username'] for c in REQUIRED_CHANNELS]}")
     
     app = Application.builder().token(BOT_TOKEN).build()
@@ -1426,12 +1569,17 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear_history))
     
-    for cmd in ["stats", "users", "broadcast"]:
+    for cmd in ["stats", "users", "broadcast", "refresh"]:
         app.add_handler(CommandHandler(cmd, admin_commands))
     
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
     app.add_error_handler(error_handler)
+    
+    # Schedule model auto-refresh
+    if app.job_queue:
+        app.job_queue.run_repeating(refresh_groq_models, interval=MODEL_REFRESH_INTERVAL, first=60)
+        logger.info(f"⏰ Model auto-refresh scheduled every {MODEL_REFRESH_INTERVAL}s")
     
     logger.info(f"✅ Bot is running with {len(ai.models)} models!")
     logger.info(f"📋 Available models: {list(ai.models.keys())}")
