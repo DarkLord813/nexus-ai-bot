@@ -47,7 +47,9 @@ admin_ids_str = os.getenv("ADMIN_IDS", "")
 if admin_ids_str:
     ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
 
-# Force Join Channels (with IDs for reliable checking)
+# ============================================================================
+# FORCE JOIN CHANNELS
+# ============================================================================
 REQUIRED_CHANNELS = []
 for i in range(1, 10):
     username = os.getenv(f"CHANNEL_{i}_USERNAME")
@@ -60,12 +62,12 @@ for i in range(1, 10):
             "id": channel_id
         })
 
-# Default channels if none configured
+# Default force-join channels (used if no env vars are set)
 if not REQUIRED_CHANNELS:
     REQUIRED_CHANNELS = [
-        {"username": "NCKDEVFreeSC", "link": "https://t.me/NCKDEVFreeSC", "id": "-1003637300526"},
+        {"username": "NCK_Dev", "link": "https://t.me/NCK_Dev", "id": "-1002583286874"},
         {"username": "ERRORX404E", "link": "https://t.me/ERRORX404E", "id": "-1004384280494"},
-        {"username": "NCK_Dev", "link": "https://t.me/NCK_Dev", "id": None}
+        {"username": "NCKDEVFreeSC", "link": "https://t.me/NCKDEVFreeSC", "id": "-1003637300526"},
     ]
 
 VERIFICATION_HOURS = int(os.getenv("VERIFICATION_HOURS", "1"))
@@ -83,6 +85,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 logger.info("🚀 Starting Nexus AI Bot...")
+logger.info(f"🔑 GROQ_API_KEY loaded: {GROQ_API_KEY[:10]}... (length: {len(GROQ_API_KEY)})")
+logger.info(f"📢 Force join channels: {[c['username'] for c in REQUIRED_CHANNELS]}")
 
 # ============================================================================
 # HEALTH SERVER + KEEP-ALIVE PING
@@ -131,11 +135,9 @@ def keep_alive_ping():
         except Exception as e:
             logger.warning(f"⚠️ Keep-alive ping failed: {e}")
 
-# Start health server thread
 health_thread = threading.Thread(target=run_health_server, daemon=True)
 health_thread.start()
 
-# Start keep-alive thread
 keep_alive_thread = threading.Thread(target=keep_alive_ping, daemon=True)
 keep_alive_thread.start()
 
@@ -153,26 +155,21 @@ class HTMLFormatter:
         if len(text.split()) > 50 and not text.startswith('🤔'):
             text = "🤔 <b>Let me think about this...</b>\n\n" + text
         
-        # Remove separators
         text = re.sub(r'━{2,}', '', text)
         text = re.sub(r'─{2,}', '', text)
         text = re.sub(r'---+\s*', '', text)
         text = re.sub(r'—+', '', text)
         
-        # Convert markdown to HTML
         text = re.sub(r'\*\*([^*]+?)\*\*', r'<b>\1</b>', text)
         text = re.sub(r'__([^_]+?)__', r'<i>\1</i>', text)
         
-        # Convert headers
         text = re.sub(r'^# (.*?)$', r'<b>📌 \1</b>', text, flags=re.MULTILINE)
         text = re.sub(r'^## (.*?)$', r'<b>▸ \1</b>', text, flags=re.MULTILINE)
         text = re.sub(r'^### (.*?)$', r'<b>◦ \1</b>', text, flags=re.MULTILINE)
         
-        # Convert tables
         text = HTMLFormatter._format_tables(text)
         text = re.sub(r'\n{3,}', '\n\n', text)
         
-        # Format lists
         lines = text.split('\n')
         formatted_lines = []
         in_list = False
@@ -437,7 +434,7 @@ class GroqAI:
         logger.info(f"📋 Available models: {list(self.models.keys())}")
     
     def _call_groq_api(self, messages: List[dict]) -> Tuple[str, bool]:
-        """Call Groq API"""
+        """Call Groq API directly using requests"""
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
@@ -450,8 +447,26 @@ class GroqAI:
             "top_p": 0.9
         }
         
+        # ============ DEBUG: Log request info ============
+        logger.info(f"🔵 [GROQ DEBUG] ========== API CALL START ==========")
+        logger.info(f"🔵 [GROQ DEBUG] URL: {self.api_url}")
+        logger.info(f"🔵 [GROQ DEBUG] Model key: {self.current_model}")
+        logger.info(f"🔵 [GROQ DEBUG] Model ID: {self.models[self.current_model]['model']}")
+        logger.info(f"🔵 [GROQ DEBUG] API key (first 10 chars): {self.api_key[:10]}...")
+        logger.info(f"🔵 [GROQ DEBUG] API key length: {len(self.api_key)}")
+        logger.info(f"🔵 [GROQ DEBUG] Messages count: {len(messages)}")
+        logger.info(f"🔵 [GROQ DEBUG] Request payload: {json.dumps(data)[:500]}")
+        # =================================================
+        
         try:
             response = requests.post(self.api_url, headers=headers, json=data, timeout=60)
+            
+            # ============ DEBUG: Log response info ============
+            logger.info(f"🟢 [GROQ DEBUG] Response status: {response.status_code}")
+            logger.info(f"🟢 [GROQ DEBUG] Response headers: {dict(response.headers)}")
+            logger.info(f"🟢 [GROQ DEBUG] Response body (first 1000 chars): {response.text[:1000]}")
+            logger.info(f"🟢 [GROQ DEBUG] ========== API CALL END ==========")
+            # ===================================================
             
             if response.status_code == 200:
                 return response.json()["choices"][0]["message"]["content"], False
@@ -472,9 +487,15 @@ class GroqAI:
                 return "❌ <b>Something went wrong</b>\n\nPlease try again later.", False
                 
         except requests.exceptions.Timeout:
+            logger.error(f"🔴 [GROQ DEBUG] Request TIMEOUT after 60 seconds")
             return "⏰ <b>Timeout</b>\n\nThe AI service is taking too long.", False
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"🔴 [GROQ DEBUG] CONNECTION ERROR: {e}")
+            return "❌ <b>Error</b>\n\nSomething went wrong.", False
         except Exception as e:
-            logger.error(f"API error: {e}")
+            logger.error(f"🔴 [GROQ DEBUG] GENERAL EXCEPTION: {type(e).__name__}: {e}")
+            import traceback
+            logger.error(f"🔴 [GROQ DEBUG] Traceback: {traceback.format_exc()}")
             return "❌ <b>Error</b>\n\nSomething went wrong.", False
     
     def chat(self, prompt: str, user_id: int) -> str:
@@ -657,7 +678,7 @@ async def check_user_subscription(user_id: int, context: ContextTypes.DEFAULT_TY
         channel_id = channel.get("id")
         joined = False
         
-        # Try by ID first (more reliable)
+        # Try by ID first (more reliable for private channels)
         if channel_id:
             try:
                 chat_member = await context.bot.get_chat_member(
@@ -666,8 +687,8 @@ async def check_user_subscription(user_id: int, context: ContextTypes.DEFAULT_TY
                 )
                 if chat_member.status in ["member", "administrator", "creator"]:
                     joined = True
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Channel ID check failed for {channel_id}: {e}")
         
         # Fallback to username
         if not joined:
@@ -678,8 +699,8 @@ async def check_user_subscription(user_id: int, context: ContextTypes.DEFAULT_TY
                 )
                 if chat_member.status in ["member", "administrator", "creator"]:
                     joined = True
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Channel username check failed for {username}: {e}")
         
         if not joined:
             not_joined.append(channel)
