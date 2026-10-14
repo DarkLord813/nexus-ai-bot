@@ -41,7 +41,7 @@ DRIFT_API_KEY = os.getenv("DRIFT_API_KEY", "drift")
 
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "300"))
-MODEL_REFRESH_INTERVAL = int(os.getenv("MODEL_REFRESH_INTERVAL", "21600"))  # 6 hours
+MODEL_REFRESH_INTERVAL = int(os.getenv("MODEL_REFRESH_INTERVAL", "21600"))
 
 ADMIN_IDS = []
 admin_ids_str = os.getenv("ADMIN_IDS", "")
@@ -143,7 +143,7 @@ keep_alive_thread = threading.Thread(target=keep_alive_ping, daemon=True)
 keep_alive_thread.start()
 
 # ============================================================================
-# HTML FORMATTER
+# HTML FORMATTER - WITH SANITIZATION
 # ============================================================================
 class HTMLFormatter:
     """Format responses using HTML for Telegram - Clean style without separators"""
@@ -152,6 +152,40 @@ class HTMLFormatter:
     def format_response(text: str) -> str:
         """Format text using HTML tags with clean style"""
         text = text.strip()
+        
+        # ===== SANITIZE: Strip or convert unsupported HTML tags =====
+        # Convert line-break tags to actual newlines
+        text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<p\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</p\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<div\s*>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'</div\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<span[^>]*>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'</span\s*>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'<hr\s*/?>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<ul\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</ul\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<ol\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</ol\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<li\s*>', '• ', text, flags=re.IGNORECASE)
+        text = re.sub(r'</li\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<h[1-6]\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</h[1-6]\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<table[^>]*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</table\s*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<tr[^>]*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'</tr\s*>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'<t[dh][^>]*>', ' | ', text, flags=re.IGNORECASE)
+        text = re.sub(r'</t[dh]\s*>', '', text, flags=re.IGNORECASE)
+        
+        # Remove any other unsupported tags (keep only Telegram-supported ones)
+        allowed_tags = r'(?:b|strong|i|em|u|ins|s|strike|del|a|code|pre|tg-spoiler)'
+        text = re.sub(
+            rf'</?(?!{allowed_tags}\b)[a-zA-Z][^>]*>',
+            '',
+            text
+        )
+        # ============================================================
         
         if len(text.split()) > 50 and not text.startswith('🤔'):
             text = "🤔 <b>Let me think about this...</b>\n\n" + text
@@ -225,7 +259,32 @@ class HTMLFormatter:
             if 'Need more help' not in result:
                 result += "\n\n💡 <b>Need more help? Just ask!</b> 🚀"
         
+        # ===== FINAL SANITIZE: Remove unbalanced tags =====
+        result = HTMLFormatter._balance_tags(result)
+        # ====================================================
+        
         return result
+    
+    @staticmethod
+    def _balance_tags(text: str) -> str:
+        """Remove unbalanced HTML tags to prevent parse errors"""
+        for tag in ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'pre', 'tg-spoiler']:
+            open_count = len(re.findall(rf'<{tag}(?:\s[^>]*)?>', text))
+            close_count = len(re.findall(rf'</{tag}\s*>', text))
+            
+            if open_count != close_count:
+                logger.warning(f"⚠️ Unbalanced <{tag}> tags: {open_count} open vs {close_count} close. Stripping all.")
+                text = re.sub(rf'</?{tag}(?:\s[^>]*)?>', '', text)
+        
+        # Handle <a> tags separately
+        a_opens = re.findall(r'<a\s+href="[^"]*"[^>]*>', text)
+        a_closes = len(re.findall(r'</a\s*>', text))
+        if len(a_opens) != a_closes:
+            logger.warning(f"⚠️ Unbalanced <a> tags. Stripping all.")
+            text = re.sub(r'<a\s+[^>]*>', '', text)
+            text = re.sub(r'</a\s*>', '', text)
+        
+        return text
     
     @staticmethod
     def _format_tables(text: str) -> str:
@@ -372,7 +431,7 @@ class GroqAI:
         self.groq_limit_reached = False
         self.groq_limit_reset_time = None
         
-        # Known chat models metadata (used to enrich API-fetched models)
+        # Known chat models metadata
         self.known_chat_models = {
             "openai/gpt-oss-120b": {
                 "name": "GPT-OSS 120B",
@@ -418,7 +477,7 @@ class GroqAI:
             },
         }
         
-        # Fallback base_models (used only if API fetch fails)
+        # Fallback base_models
         self.base_models = {
             "gpt-oss-20b": {
                 "name": "GPT-OSS 20B",
@@ -441,7 +500,7 @@ class GroqAI:
         # Try to fetch live models on startup
         self.fetch_available_models()
         
-        # Drift models (DeepSeek and GPT)
+        # Drift models
         self.drift_models = {}
         if self.drift.is_available("deepseek"):
             self.drift_models["deepseek"] = {
@@ -465,7 +524,7 @@ class GroqAI:
         
         self.models = {**self.base_models, **self.drift_models}
         
-        # Set initial model (pick first available)
+        # Set initial model
         if self.base_models:
             self.current_model = list(self.base_models.keys())[0]
         else:
@@ -507,7 +566,6 @@ class GroqAI:
             
             logger.info(f"📥 Groq returned {len(model_list)} models")
             
-            # Filter to only chat-capable models we have metadata for
             new_base = {}
             for m in model_list:
                 mid = m.get("id", "")
@@ -520,11 +578,8 @@ class GroqAI:
             if new_base:
                 self.base_models = new_base
                 self.last_model_refresh = datetime.now()
-                
-                # Rebuild combined models dict
                 self.models = {**self.base_models, **self.drift_models}
                 
-                # If current_model is no longer available, switch to first available
                 if self.current_model not in self.models:
                     self.current_model = list(self.base_models.keys())[0]
                     logger.info(f"🔄 Current model was removed, switched to: {self.current_model}")
@@ -655,7 +710,8 @@ FORMATTING RULES:
 - Use numbers for steps
 - Use ✅ for completed items
 - Use ⚠️ for warnings
-- Use 💡 for tips"""
+- Use 💡 for tips
+- IMPORTANT: Do NOT use HTML tags like <br>, <p>, <div>, <span>. Use plain newlines instead."""
         
         messages = [{"role": "system", "content": system_prompt}]
         
@@ -1026,7 +1082,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data = query.data
     
-    # Handle subscription check
     if data == "check_subscription":
         is_subscribed, not_joined = await check_user_subscription(user_id, context)
         if is_subscribed:
@@ -1053,7 +1108,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
     
-    # Handle fallback model selection
     if data.startswith("fallback_model_"):
         model_key = data.replace("fallback_model_", "")
         
@@ -1071,14 +1125,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
     
-    # Handle main menu
     if data == "main_menu":
         if not await force_join_check(update, context):
             return
         await show_main_menu(update, context, first_time=False)
         return
     
-    # Handle history view
     if data == "history_view":
         if not await force_join_check(update, context):
             return
@@ -1107,7 +1159,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle clear history
     if data == "clear_history_confirm":
         if not await force_join_check(update, context):
             return
@@ -1120,7 +1171,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
     
-    # Handle model selection
     if data == "model_select":
         if not await force_join_check(update, context):
             return
@@ -1145,7 +1195,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle set model
     if data.startswith("set_model_"):
         if not await force_join_check(update, context):
             return
@@ -1165,7 +1214,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
     
-    # Handle chat mode
     if data == "chat_mode":
         if not await force_join_check(update, context):
             return
@@ -1186,7 +1234,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle help menu
     if data == "help_menu":
         if not await force_join_check(update, context):
             return
@@ -1216,7 +1263,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle admin panel
     if data == "admin_panel":
         if not is_admin(user_id):
             await query.edit_message_text("⛔ <b>Access denied!</b>", parse_mode="HTML")
@@ -1234,7 +1280,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle admin refresh
     if data == "admin_refresh":
         if not is_admin(user_id):
             return
@@ -1255,7 +1300,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
     
-    # Handle admin stats
     if data == "admin_stats":
         if not is_admin(user_id):
             return
@@ -1286,7 +1330,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle admin users
     if data == "admin_users":
         if not is_admin(user_id):
             return
@@ -1302,7 +1345,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle admin broadcast
     if data == "admin_broadcast":
         if not is_admin(user_id):
             return
@@ -1317,7 +1359,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle cancel broadcast
     if data == "cancel_broadcast":
         for k in ['broadcast_step', 'broadcast_image', 'broadcast_caption', 'broadcast_buttons']:
             context.user_data.pop(k, None)
@@ -1328,7 +1369,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle confirm broadcast
     if data == "confirm_broadcast":
         if not is_admin(user_id):
             return
@@ -1379,7 +1419,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle rate prompt
     if data == "rate_prompt":
         if not await force_join_check(update, context):
             return
@@ -1412,7 +1451,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    # Handle rating
     if data.startswith("rate_"):
         if not await force_join_check(update, context):
             return
@@ -1447,7 +1485,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
     
-    # Handle regenerate
     if data.startswith("regen_"):
         if not await force_join_check(update, context):
             return
@@ -1547,6 +1584,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(resp, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
+        logger.error(f"Message handler error: {e}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
 # ============================================================================
@@ -1576,7 +1614,6 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
     app.add_error_handler(error_handler)
     
-    # Schedule model auto-refresh
     if app.job_queue:
         app.job_queue.run_repeating(refresh_groq_models, interval=MODEL_REFRESH_INTERVAL, first=60)
         logger.info(f"⏰ Model auto-refresh scheduled every {MODEL_REFRESH_INTERVAL}s")
