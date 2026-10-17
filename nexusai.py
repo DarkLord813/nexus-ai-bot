@@ -1,1626 +1,1265 @@
 import os
-import io
-import logging
+import sys
+import requests
 import json
-import threading
 import time
 import re
+import sqlite3
+import random
+import string
+import threading
 import asyncio
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional
-from collections import defaultdict
-
-from dotenv import load_dotenv
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    ContextTypes
-)
-from PIL import Image
-import requests
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.error import TelegramError
+import logging
 
-load_dotenv()
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN not found in environment variables!")
-
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY not found in environment variables!")
-
-DRIFT_API_URL = os.getenv("DRIFT_API_URL", "https://drift-ai-api.vercel.app/ask")
-DRIFT_API_KEY = os.getenv("DRIFT_API_KEY", "drift")
-
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
-KEEP_ALIVE_INTERVAL = int(os.getenv("KEEP_ALIVE_INTERVAL", "300"))
-MODEL_REFRESH_INTERVAL = int(os.getenv("MODEL_REFRESH_INTERVAL", "21600"))
-
-ADMIN_IDS = []
-admin_ids_str = os.getenv("ADMIN_IDS", "")
-if admin_ids_str:
-    ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
-
-# ============================================================================
-# FORCE JOIN CHANNELS
-# ============================================================================
-REQUIRED_CHANNELS = []
-for i in range(1, 10):
-    username = os.getenv(f"CHANNEL_{i}_USERNAME")
-    link = os.getenv(f"CHANNEL_{i}_LINK")
-    channel_id = os.getenv(f"CHANNEL_{i}_ID")
-    if username and link:
-        REQUIRED_CHANNELS.append({
-            "username": username,
-            "link": link,
-            "id": channel_id
-        })
-
-if not REQUIRED_CHANNELS:
-    REQUIRED_CHANNELS = [
-        {"username": "NCK_Dev", "link": "https://t.me/NCK_Dev", "id": "-1002583286874"},
-        {"username": "ERRORX404E", "link": "https://t.me/ERRORX404E", "id": "-1004384280494"},
-        {"username": "NCKDEVFreeSC", "link": "https://t.me/NCKDEVFreeSC", "id": "-1003637300526"},
-        {"username": "NEXUSAII", "link": "https://t.me/NEXUSAII", "id": "-1004447376177"},
-    ]
-
-VERIFICATION_HOURS = int(os.getenv("VERIFICATION_HOURS", "1"))
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-RATE_LIMIT_SECONDS = int(os.getenv("RATE_LIMIT_SECONDS", "5"))
-MAX_MESSAGES_PER_MINUTE = int(os.getenv("MAX_MESSAGES_PER_MINUTE", "10"))
-
-# ============================================================================
-# LOGGING
-# ============================================================================
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=getattr(logging, LOG_LEVEL.upper())
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-logger.info("🚀 Starting Nexus AI Bot...")
-logger.info(f"🔑 GROQ_API_KEY loaded: {GROQ_API_KEY[:10]}... (length: {len(GROQ_API_KEY)})")
-logger.info(f"📢 Force join channels: {[c['username'] for c in REQUIRED_CHANNELS]}")
+# -------------------- ENVIRONMENT VARIABLES --------------------
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+API_BASE = os.environ.get('API_BASE', 'https://api.mail.tm')
+DB_PATH = os.environ.get('DB_PATH', 'temp_mail.db')
 
-# ============================================================================
-# HEALTH SERVER + KEEP-ALIVE PING
-# ============================================================================
-from http.server import HTTPServer, BaseHTTPRequestHandler
+# -------------------- FORCE JOIN CHANNELS --------------------
+FORCE_CHANNELS = [
+    ("@NCK_Dev",       "https://t.me/NCK_Dev"),
+    ("@NCKDEVFreeSC",  "https://t.me/NCKDEVFreeSC"),
+    ("@ERRORX404E",    "https://t.me/ERRORX404E"),
+]
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header('Content-Type', 'text/plain')
-        self.end_headers()
-        self.wfile.write(b'OK - Nexus AI Bot is running')
-    
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-    
-    def log_message(self, format, *args):
-        return
+if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN environment variable is not set!")
+    sys.exit(1)
 
-def run_health_server():
-    port = int(os.getenv('PORT', 10000))
-    try:
-        server = HTTPServer(('0.0.0.0', port), HealthHandler)
-        logger.info(f"✅ Health server running on port {port}")
-        server.serve_forever()
-    except Exception as e:
-        logger.warning(f"⚠️ Health server error: {e}")
+logger.info("✅ Environment variables loaded")
+logger.info(f"📢 Force join channels: {', '.join(ch for ch, _ in FORCE_CHANNELS)}")
+logger.info(f"📊 Database: {DB_PATH}")
 
-def keep_alive_ping():
-    """Ping the app URL every KEEP_ALIVE_INTERVAL seconds to keep it awake"""
-    if not RENDER_EXTERNAL_URL:
-        logger.info("ℹ️ KEEP_ALIVE: RENDER_EXTERNAL_URL not set, skipping keep-alive ping")
-        return
-    
-    logger.info(f"🔄 Keep-alive started (interval: {KEEP_ALIVE_INTERVAL}s, URL: {RENDER_EXTERNAL_URL})")
-    
+
+# ==================== HEALTH CHECK SERVER (Star Cards style) ====================
+def start_health_server():
+    """Minimal HTTP server responding 'OK' on any path."""
+    port = int(os.getenv("PORT", "8080"))
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    def serve():
+        try:
+            HTTPServer(("0.0.0.0", port), H).serve_forever()
+        except Exception as e:
+            logger.warning(f"health server failed: {e}")
+
+    threading.Thread(target=serve, daemon=True, name="health").start()
+    logger.info(f"🏥 Health server on :{port}")
+
+
+# ==================== KEEP-ALIVE (Self-Ping) ====================
+def _self_ping_thread():
+    """
+    Self-ping keep-alive:
+      - Primary URL: RENDER_EXTERNAL_URL (auto-set by Render)
+      - Fallback:    KEEPALIVE_URL env var
+      - Last resort: localhost
+      - Pings the root path '/' every 10 minutes
+      - Auto-switches to localhost after 3 consecutive failures
+    """
+    url = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("KEEPALIVE_URL", "")
+    if url:
+        ping_url = url.rstrip("/") + "/"
+    else:
+        port = int(os.environ.get("PORT", 8080))
+        ping_url = f"http://localhost:{port}/"
+
+    time.sleep(30)
+    logger.info(f"💓 Self-ping started → {ping_url}")
+
+    consecutive_failures = 0
     while True:
         try:
-            time.sleep(KEEP_ALIVE_INTERVAL)
-            response = requests.get(RENDER_EXTERNAL_URL, timeout=10)
-            if response.status_code == 200:
-                logger.info(f"💓 Keep-alive ping successful at {datetime.now().strftime('%H:%M:%S')}")
-            else:
-                logger.warning(f"⚠️ Keep-alive ping returned status {response.status_code}")
+            req = requests.get(ping_url, timeout=15,
+                               headers={"User-Agent": "TempMailBot-SelfPing/1.0"})
+            if consecutive_failures > 0:
+                logger.info(f"💓 Self-ping recovered after {consecutive_failures} failures")
+            consecutive_failures = 0
+            logger.info(f"💓 Self-ping OK ({ping_url}) → {req.status_code}")
         except Exception as e:
-            logger.warning(f"⚠️ Keep-alive ping failed: {e}")
+            consecutive_failures += 1
+            logger.warning(f"⚠️ Self-ping failed ({ping_url}) [x{consecutive_failures}]: {e}")
 
-health_thread = threading.Thread(target=run_health_server, daemon=True)
-health_thread.start()
+            if consecutive_failures >= 3 and not ping_url.startswith("http://localhost"):
+                port = int(os.environ.get("PORT", 8080))
+                fallback = f"http://localhost:{port}/"
+                logger.info(f"🔄 Switching self-ping target to localhost: {fallback}")
+                ping_url = fallback
+                consecutive_failures = 0
 
-keep_alive_thread = threading.Thread(target=keep_alive_ping, daemon=True)
-keep_alive_thread.start()
+        time.sleep(600)
 
-# ============================================================================
-# HTML FORMATTER - WITH SANITIZATION
-# ============================================================================
-class HTMLFormatter:
-    """Format responses using HTML for Telegram - Clean style without separators"""
-    
-    @staticmethod
-    def format_response(text: str) -> str:
-        """Format text using HTML tags with clean style"""
-        text = text.strip()
-        
-        # ===== SANITIZE: Strip or convert unsupported HTML tags =====
-        # Convert line-break tags to actual newlines
-        text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'<p\s*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'</p\s*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'<div\s*>', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'</div\s*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'<span[^>]*>', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'</span\s*>', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'<hr\s*/?>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'<ul\s*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'</ul\s*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'<ol\s*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'</ol\s*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'<li\s*>', '• ', text, flags=re.IGNORECASE)
-        text = re.sub(r'</li\s*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'<h[1-6]\s*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'</h[1-6]\s*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'<table[^>]*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'</table\s*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'<tr[^>]*>', '\n', text, flags=re.IGNORECASE)
-        text = re.sub(r'</tr\s*>', '', text, flags=re.IGNORECASE)
-        text = re.sub(r'<t[dh][^>]*>', ' | ', text, flags=re.IGNORECASE)
-        text = re.sub(r'</t[dh]\s*>', '', text, flags=re.IGNORECASE)
-        
-        # Remove any other unsupported tags (keep only Telegram-supported ones)
-        allowed_tags = r'(?:b|strong|i|em|u|ins|s|strike|del|a|code|pre|tg-spoiler)'
-        text = re.sub(
-            rf'</?(?!{allowed_tags}\b)[a-zA-Z][^>]*>',
-            '',
-            text
-        )
-        # ============================================================
-        
-        if len(text.split()) > 50 and not text.startswith('🤔'):
-            text = "🤔 <b>Let me think about this...</b>\n\n" + text
-        
-        text = re.sub(r'━{2,}', '', text)
-        text = re.sub(r'─{2,}', '', text)
-        text = re.sub(r'---+\s*', '', text)
-        text = re.sub(r'—+', '', text)
-        
-        text = re.sub(r'\*\*([^*]+?)\*\*', r'<b>\1</b>', text)
-        text = re.sub(r'__([^_]+?)__', r'<i>\1</i>', text)
-        
-        text = re.sub(r'^# (.*?)$', r'<b>📌 \1</b>', text, flags=re.MULTILINE)
-        text = re.sub(r'^## (.*?)$', r'<b>▸ \1</b>', text, flags=re.MULTILINE)
-        text = re.sub(r'^### (.*?)$', r'<b>◦ \1</b>', text, flags=re.MULTILINE)
-        
-        text = HTMLFormatter._format_tables(text)
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        
-        lines = text.split('\n')
-        formatted_lines = []
-        in_list = False
-        list_type = None
-        list_counter = 1
-        
-        for i, line in enumerate(lines):
-            line = line.strip()
-            
-            if not line and i == 0:
-                continue
-            
-            if line in ['---', '—', '━', '─'] or re.match(r'^[-—━─]{2,}$', line):
-                continue
-            
-            numbered_match = re.match(r'^(\d+)\.\s+(.*)', line)
-            if numbered_match:
-                if not in_list or list_type != 'numbered':
-                    if in_list:
-                        formatted_lines.append('')
-                    list_type = 'numbered'
-                    list_counter = 1
-                    in_list = True
-                formatted_lines.append(f"{list_counter}. {numbered_match.group(2)}")
-                list_counter += 1
-                continue
-            
-            bullet_match = re.match(r'^[-•]\s+(.*)', line)
-            if bullet_match:
-                if not in_list or list_type != 'bullet':
-                    if in_list:
-                        formatted_lines.append('')
-                    list_type = 'bullet'
-                    in_list = True
-                formatted_lines.append(f"• {bullet_match.group(1)}")
-                continue
-            
-            if in_list and line and not re.match(r'^(\d+\.|[-•])\s+', line):
-                in_list = False
-                list_type = None
-            
-            line = HTMLFormatter._format_inline(line)
-            formatted_lines.append(line)
-        
-        result = '\n'.join(formatted_lines)
-        result = re.sub(r'\n{3,}', '\n\n', result)
-        result = re.sub(r'\n\s*---+\s*\n', '\n\n', result)
-        result = re.sub(r'^---+\s*\n', '', result)
-        result = re.sub(r'\n---+\s*$', '', result)
-        
-        if len(result.split()) > 40 and not result.endswith('🚀'):
-            if 'Need more help' not in result:
-                result += "\n\n💡 <b>Need more help? Just ask!</b> 🚀"
-        
-        # ===== FINAL SANITIZE: Remove unbalanced tags =====
-        result = HTMLFormatter._balance_tags(result)
-        # ====================================================
-        
-        return result
-    
-    @staticmethod
-    def _balance_tags(text: str) -> str:
-        """Remove unbalanced HTML tags to prevent parse errors"""
-        for tag in ['b', 'strong', 'i', 'em', 'u', 'ins', 's', 'strike', 'del', 'code', 'pre', 'tg-spoiler']:
-            open_count = len(re.findall(rf'<{tag}(?:\s[^>]*)?>', text))
-            close_count = len(re.findall(rf'</{tag}\s*>', text))
-            
-            if open_count != close_count:
-                logger.warning(f"⚠️ Unbalanced <{tag}> tags: {open_count} open vs {close_count} close. Stripping all.")
-                text = re.sub(rf'</?{tag}(?:\s[^>]*)?>', '', text)
-        
-        # Handle <a> tags separately
-        a_opens = re.findall(r'<a\s+href="[^"]*"[^>]*>', text)
-        a_closes = len(re.findall(r'</a\s*>', text))
-        if len(a_opens) != a_closes:
-            logger.warning(f"⚠️ Unbalanced <a> tags. Stripping all.")
-            text = re.sub(r'<a\s+[^>]*>', '', text)
-            text = re.sub(r'</a\s*>', '', text)
-        
-        return text
-    
-    @staticmethod
-    def _format_tables(text: str) -> str:
-        """Convert markdown tables to readable format"""
-        lines = text.split('\n')
-        result = []
-        in_table = False
-        table_lines = []
-        
-        for line in lines:
-            if '|' in line and line.strip().startswith('|'):
-                in_table = True
-                table_lines.append(line)
-            else:
-                if in_table and table_lines:
-                    result.append(HTMLFormatter._process_table(table_lines))
-                    table_lines = []
-                    in_table = False
-                result.append(line)
-        
-        if in_table and table_lines:
-            result.append(HTMLFormatter._process_table(table_lines))
-        
-        return '\n'.join(result)
-    
-    @staticmethod
-    def _process_table(table_lines: List[str]) -> str:
-        """Process a markdown table into readable text"""
-        if len(table_lines) < 2:
-            return '\n'.join(table_lines)
-        
-        headers = [h.strip() for h in table_lines[0].strip('|').split('|')]
-        
-        rows = []
-        for line in table_lines[2:]:
-            if '|' in line:
-                cells = [c.strip() for c in line.strip('|').split('|')]
-                if cells and any(cells):
-                    rows.append(cells)
-        
-        if not rows:
-            return '\n'.join(table_lines)
-        
-        result = []
-        result.append("📋 <b>" + " | ".join(headers) + "</b>")
-        for row in rows[:5]:
-            result.append("• " + " | ".join(row))
-        
-        if len(rows) > 5:
-            result.append(f"• ... and {len(rows) - 5} more rows")
-        
-        return '\n'.join(result)
-    
-    @staticmethod
-    def _format_inline(text: str) -> str:
-        """Format inline elements with HTML"""
-        text = re.sub(r'```(\w+)?\n(.*?)\n```', r'<pre><code>\2</code></pre>', text, flags=re.DOTALL)
-        text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
-        text = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'<a href="\2">\1</a>', text)
-        text = re.sub(r'\*\*([^*]+?)\*\*', r'<b>\1</b>', text)
-        text = re.sub(r'__([^_]+?)__', r'<i>\1</i>', text)
-        text = re.sub(r'(?<!\w)\*([^*]+?)\*(?!\w)', r'<i>\1</i>', text)
-        return text
 
-# ============================================================================
-# DRIFT API INTEGRATION
-# ============================================================================
-class DriftAPI:
-    """Integration with Drift AI API for DeepSeek and ChatGPT models"""
-    
-    def __init__(self, api_url: str, api_key: str):
-        self.api_url = api_url
-        self.api_key = api_key
-        self.available_models = []
-        self.models_status = {}
-        self._check_models()
-    
-    def _check_models(self):
-        """Check which models are available via the API"""
-        test_models = ["deepseek", "gpt-oss"]
-        
-        for model_type in test_models:
+# ==================== POLLING WATCHDOG ====================
+async def polling_watchdog(application: Application, interval: int = 90):
+    """
+    Detect silent long-polling hangs and force reconnection.
+
+    python-telegram-bot's Updater can silently lose its getUpdates
+    connection (NAT timeout, firewall drop, platform hiccup) — the process
+    stays alive, getMe keeps working, but no messages ever arrive again.
+
+    This watchdog polls the Telegram API directly every `interval` seconds:
+      - If getUpdates hangs or times out → the updater is stuck
+      - If no updates arrive for 3 consecutive checks (~4.5 min) → restart
+    """
+    await asyncio.sleep(30)
+    logger.info("🐕 Polling watchdog started")
+
+    stale_checks = 0
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+
+            updater = application.updater
+            if not updater or not updater.running:
+                logger.warning("🐕 Watchdog: updater not running — skipping check")
+                continue
+
+            # 1. Sanity check: is the bot reachable?
             try:
-                response = requests.get(
-                    self.api_url,
-                    params={"q": "test", "key": self.api_key, "type": model_type},
-                    timeout=5
+                await asyncio.wait_for(
+                    application.bot.get_me(),
+                    timeout=15
                 )
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get("success"):
-                        self.available_models.append(model_type)
-                        self.models_status[model_type] = True
-                        logger.info(f"✅ Drift API - {model_type} is available")
-                    else:
-                        self.models_status[model_type] = False
-                else:
-                    self.models_status[model_type] = False
+            except asyncio.TimeoutError:
+                logger.warning("🐕 Watchdog: get_me timed out — network may be down")
+                continue
             except Exception as e:
-                logger.warning(f"⚠️ Drift API - {model_type} not available: {e}")
-                self.models_status[model_type] = False
-    
-    def query(self, prompt: str, model_type: str) -> Optional[str]:
-        """Query the Drift API with a prompt"""
-        if model_type not in self.available_models:
-            return None
-        
-        try:
-            response = requests.get(
-                self.api_url,
-                params={"q": prompt, "key": self.api_key, "type": model_type},
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("success"):
-                    return data.get("reply", "")
-                else:
-                    return None
-            else:
-                return None
-        except Exception as e:
-            logger.error(f"Drift API error: {e}")
-            return None
-    
-    def is_available(self, model_type: str) -> bool:
-        """Check if a specific model is available"""
-        return model_type in self.available_models
+                logger.warning(f"🐕 Watchdog: get_me failed: {e}")
+                continue
 
-# ============================================================================
-# GROQ AI CLASS WITH AUTO-UPDATING MODELS
-# ============================================================================
-class GroqAI:
-    def __init__(self):
-        logger.info("🔄 Initializing Groq AI...")
-        
-        self.api_key = GROQ_API_KEY
-        self.api_url = "https://api.groq.com/openai/v1/chat/completions"
-        self.models_url = "https://api.groq.com/openai/v1/models"
-        
-        self.drift = DriftAPI(DRIFT_API_URL, DRIFT_API_KEY)
-        
-        self.groq_limit_reached = False
-        self.groq_limit_reset_time = None
-        
-        # Known chat models metadata
-        self.known_chat_models = {
-            "openai/gpt-oss-120b": {
-                "name": "GPT-OSS 120B",
-                "description": "🧠 Most Powerful",
-                "speed": "⚡ Fast",
-                "context": "📏 131K",
-                "provider": "Groq"
-            },
-            "openai/gpt-oss-20b": {
-                "name": "GPT-OSS 20B",
-                "description": "🚀 Fastest",
-                "speed": "⚡ Ultra Fast",
-                "context": "📏 131K",
-                "provider": "Groq"
-            },
-            "openai/gpt-oss-safeguard-20b": {
-                "name": "GPT-OSS Safeguard 20B",
-                "description": "🛡️ Safe Mode",
-                "speed": "⚡ Fast",
-                "context": "📏 131K",
-                "provider": "Groq"
-            },
-            "qwen/qwen3.6-27b": {
-                "name": "Qwen 3.6 27B",
-                "description": "⚖️ Balanced",
-                "speed": "⚡ Fast",
-                "context": "📏 131K",
-                "provider": "Groq"
-            },
-            "meta-llama/llama-4-scout-17b-16e-instruct": {
-                "name": "Llama 4 Scout 17B",
-                "description": "🎯 Instruction Tuned",
-                "speed": "⚡ Fast",
-                "context": "📏 131K",
-                "provider": "Groq"
-            },
-            "meta-llama/llama-4-maverick-17b-128e-instruct": {
-                "name": "Llama 4 Maverick 17B",
-                "description": "🚀 High Performance",
-                "speed": "⚡ Fast",
-                "context": "📏 131K",
-                "provider": "Groq"
-            },
-        }
-        
-        # Fallback base_models
-        self.base_models = {
-            "gpt-oss-20b": {
-                "name": "GPT-OSS 20B",
-                "model": "openai/gpt-oss-20b",
-                "description": "🚀 Fastest",
-                "speed": "⚡ Ultra Fast",
-                "context": "📏 131K",
-                "provider": "Groq"
-            },
-            "gpt-oss-120b": {
-                "name": "GPT-OSS 120B",
-                "model": "openai/gpt-oss-120b",
-                "description": "🧠 Most Powerful",
-                "speed": "⚡ Fast",
-                "context": "📏 131K",
-                "provider": "Groq"
-            },
-        }
-        
-        # Try to fetch live models on startup
-        self.fetch_available_models()
-        
-        # Drift models
-        self.drift_models = {}
-        if self.drift.is_available("deepseek"):
-            self.drift_models["deepseek"] = {
-                "name": "DeepSeek V3.1",
-                "model": "deepseek",
-                "description": "🧠 Advanced Reasoning",
-                "speed": "⚡ Fast",
-                "context": "📏 128K",
-                "provider": "Drift AI"
-            }
-        
-        if self.drift.is_available("gpt-oss"):
-            self.drift_models["drift-gpt-oss"] = {
-                "name": "Drift GPT-OSS 120B",
-                "model": "gpt-oss",
-                "description": "💡 Creative & Analytical",
-                "speed": "⚡ Fast",
-                "context": "📏 32K",
-                "provider": "Drift AI"
-            }
-        
-        self.models = {**self.base_models, **self.drift_models}
-        
-        # Set initial model
-        if self.base_models:
-            self.current_model = list(self.base_models.keys())[0]
-        else:
-            self.current_model = "gpt-oss-20b"
-        
-        self.user_sessions = {}
-        self.verified_users = {}
-        self.user_cooldowns = {}
-        self.user_message_counts = {}
-        self.user_reset_time = {}
-        self.user_ratings = defaultdict(list)
-        self.last_response = {}
-        self.model_stats = defaultdict(int)
-        self.last_model_refresh = datetime.now()
-        
-        logger.info(f"✅ Groq AI ready with {len(self.models)} models!")
-        logger.info(f"📋 Available models: {list(self.models.keys())}")
-    
-    def fetch_available_models(self) -> bool:
-        """Fetch the current list of models from Groq and rebuild base_models."""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        try:
-            logger.info("🔄 Fetching available models from Groq API...")
-            resp = requests.get(self.models_url, headers=headers, timeout=10)
-            
-            if resp.status_code != 200:
-                logger.warning(f"⚠️ Model fetch failed: {resp.status_code} - {resp.text[:200]}")
-                return False
-            
-            data = resp.json()
-            model_list = data.get("data", [])
-            if not model_list:
-                logger.warning("⚠️ Model fetch returned empty list")
-                return False
-            
-            logger.info(f"📥 Groq returned {len(model_list)} models")
-            
-            new_base = {}
-            for m in model_list:
-                mid = m.get("id", "")
-                if mid in self.known_chat_models:
-                    info = self.known_chat_models[mid].copy()
-                    info["model"] = mid
-                    short_key = mid.split("/")[-1]
-                    new_base[short_key] = info
-            
-            if new_base:
-                self.base_models = new_base
-                self.last_model_refresh = datetime.now()
-                self.models = {**self.base_models, **self.drift_models}
-                
-                if self.current_model not in self.models:
-                    self.current_model = list(self.base_models.keys())[0]
-                    logger.info(f"🔄 Current model was removed, switched to: {self.current_model}")
-                
-                logger.info(f"✅ Auto-updated Groq models: {list(new_base.keys())}")
-                return True
-            else:
-                logger.warning(f"⚠️ No known chat models found. Available IDs: {[m.get('id') for m in model_list[:20]]}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"❌ Model fetch error: {e}")
-            import traceback
-            logger.error(f"❌ Traceback: {traceback.format_exc()}")
-            return False
-    
-    def _call_groq_api(self, messages: List[dict]) -> Tuple[str, bool]:
-        """Call Groq API directly using requests"""
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
-        }
-        data = {
-            "model": self.models[self.current_model]["model"],
-            "messages": messages,
-            "temperature": 0.7,
-            "max_tokens": 1000,
-            "top_p": 0.9
-        }
-        
-        logger.info(f"🔵 [GROQ DEBUG] API CALL START - Model: {self.models[self.current_model]['model']}")
-        
-        try:
-            response = requests.post(self.api_url, headers=headers, json=data, timeout=60)
-            
-            logger.info(f"🟢 [GROQ DEBUG] Status: {response.status_code} | Body: {response.text[:300]}")
-            
-            if response.status_code == 200:
-                return response.json()["choices"][0]["message"]["content"], False
-            elif response.status_code == 404:
-                logger.warning(f"⚠️ Model {self.models[self.current_model]['model']} not found. Refreshing...")
-                self.fetch_available_models()
-                return "🔄 <b>Model Updated</b>\n\nThe AI model was updated. Please try again.", False
-            elif response.status_code == 429:
-                error_msg = response.text.lower()
-                if "quota" in error_msg or "daily" in error_msg:
-                    self.groq_limit_reached = True
-                    self.groq_limit_reset_time = datetime.now() + timedelta(days=1)
-                    return "🚫 <b>Daily Limit Reached</b>\n\nThe Groq service has reached its daily limit.", True
-                else:
-                    retry_after = 60
-                    try:
-                        retry_after = int(response.headers.get('retry-after', 60))
-                    except:
-                        pass
-                    return f"🔄 <b>Service Busy</b>\n\nPlease wait: {retry_after} seconds", False
-            else:
-                return "❌ <b>Something went wrong</b>\n\nPlease try again later.", False
-                
-        except requests.exceptions.Timeout:
-            logger.error(f"🔴 [GROQ DEBUG] TIMEOUT")
-            return "⏰ <b>Timeout</b>\n\nThe AI service is taking too long.", False
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"🔴 [GROQ DEBUG] CONNECTION ERROR: {e}")
-            return "❌ <b>Error</b>\n\nSomething went wrong.", False
-        except Exception as e:
-            logger.error(f"🔴 [GROQ DEBUG] EXCEPTION: {type(e).__name__}: {e}")
-            return "❌ <b>Error</b>\n\nSomething went wrong.", False
-    
-    def chat(self, prompt: str, user_id: int) -> str:
-        """Generate chat response with fallback"""
-        if user_id not in self.user_sessions:
-            self.user_sessions[user_id] = []
-        
-        history = self.user_sessions[user_id]
-        
-        current_model_info = self.models.get(self.current_model, {})
-        is_drift_model = current_model_info.get("provider") == "Drift AI"
-        
-        if is_drift_model:
-            result = self._call_drift_api(prompt)
-            self.user_sessions[user_id].append({"role": "user", "content": prompt})
-            self.user_sessions[user_id].append({"role": "assistant", "content": result})
-            self.last_response[user_id] = result
-            self.model_stats[self.current_model] += 1
-            return result
-        
-        if self.groq_limit_reached:
-            if self.groq_limit_reset_time and datetime.now() > self.groq_limit_reset_time:
-                self.groq_limit_reached = False
-            else:
-                drift_models = [k for k, v in self.models.items() if v.get('provider') == 'Drift AI']
-                if drift_models:
-                    fallback_model = drift_models[0]
-                    old_model = self.current_model
-                    self.current_model = fallback_model
-                    result = self._call_drift_api(prompt)
-                    self.current_model = old_model
-                    
-                    fallback_name = self.models[fallback_model]['name']
-                    warning = f"⚠️ <b>Groq limit reached. Using {fallback_name} as fallback.</b>\n\n"
-                    result = warning + result
-                    
-                    self.user_sessions[user_id].append({"role": "user", "content": prompt})
-                    self.user_sessions[user_id].append({"role": "assistant", "content": result})
-                    self.last_response[user_id] = result
-                    self.model_stats[fallback_model] += 1
-                    return result
-                else:
-                    return "🚫 <b>All AI services are currently unavailable</b>\n\nPlease try again later."
-        
-        system_prompt = """You are Nexus AI, a helpful assistant.
-
-RESPONSE STYLE:
-- Be clear, structured, and detailed
-- Use markdown for formatting (**, *, `, etc.)
-- Break down complex topics
-- Provide examples when helpful
-- Use emojis for visual appeal
-- Use bullet points and numbered lists
-- Keep responses clean and not too verbose
-- Use tables for comparing data when helpful
-
-FORMATTING RULES:
-- Use **bold** for emphasis
-- Use `code` for technical terms
-- Use * for bullet points
-- Use numbers for steps
-- Use ✅ for completed items
-- Use ⚠️ for warnings
-- Use 💡 for tips
-- IMPORTANT: Do NOT use HTML tags like <br>, <p>, <div>, <span>. Use plain newlines instead."""
-        
-        messages = [{"role": "system", "content": system_prompt}]
-        
-        for msg in history[-10:]:
-            messages.append({"role": msg["role"], "content": msg["content"]})
-        
-        messages.append({"role": "user", "content": prompt})
-        
-        result, is_limit = self._call_groq_api(messages)
-        
-        if is_limit:
-            drift_models = [k for k, v in self.models.items() if v.get('provider') == 'Drift AI']
-            if drift_models:
-                fallback_model = drift_models[0]
-                old_model = self.current_model
-                self.current_model = fallback_model
-                result = self._call_drift_api(prompt)
-                self.current_model = old_model
-                
-                fallback_name = self.models[fallback_model]['name']
-                result = f"⚠️ <b>Groq limit reached. Using {fallback_name} as fallback.</b>\n\n{result}"
-                self.model_stats[fallback_model] += 1
-            else:
-                result = "🚫 <b>Groq limit reached and no fallback models available.</b>\n\nPlease try again later."
-        
-        result = HTMLFormatter.format_response(result)
-        
-        self.user_sessions[user_id].append({"role": "user", "content": prompt})
-        self.user_sessions[user_id].append({"role": "assistant", "content": result})
-        self.last_response[user_id] = result
-        self.model_stats[self.current_model] += 1
-        
-        return result
-    
-    def _call_drift_api(self, prompt: str) -> str:
-        """Call Drift API"""
-        model_type = self.models[self.current_model]["model"]
-        response = self.drift.query(prompt, model_type)
-        
-        if response is not None:
-            return response
-        else:
-            return "❌ <b>API Error</b>\n\nThe Drift AI service is currently unavailable."
-    
-    def check_rate_limit(self, user_id: int) -> Tuple[bool, str]:
-        """Check rate limit"""
-        now = time.time()
-        
-        if user_id in self.user_cooldowns:
-            time_since_last = now - self.user_cooldowns[user_id]
-            if time_since_last < RATE_LIMIT_SECONDS:
-                return False, f"⏳ Please wait {RATE_LIMIT_SECONDS - int(time_since_last)} seconds before sending another message."
-        
-        if user_id not in self.user_reset_time or now - self.user_reset_time[user_id] > 60:
-            self.user_message_counts[user_id] = 0
-            self.user_reset_time[user_id] = now
-        
-        self.user_message_counts[user_id] = self.user_message_counts.get(user_id, 0) + 1
-        if self.user_message_counts[user_id] > MAX_MESSAGES_PER_MINUTE:
-            return False, "📊 <b>Rate Limit Exceeded</b>\n\nYou've reached the maximum messages per minute. Please wait a moment."
-        
-        self.user_cooldowns[user_id] = now
-        return True, ""
-    
-    def save_rating(self, user_id: int, rating: int):
-        """Save user rating"""
-        self.user_ratings[user_id].append(rating)
-        try:
-            ratings = []
+            # 2. Probe getUpdates with a short timeout.
             try:
-                with open("ratings.json", "r") as f:
-                    for line in f:
-                        if line.strip():
-                            ratings.append(json.loads(line))
-            except:
-                pass
-            
-            ratings.append({"user": user_id, "rating": rating, "time": time.time()})
-            
-            with open("ratings.json", "w") as f:
-                for r in ratings:
-                    json.dump(r, f)
-                    f.write("\n")
+                updates = await asyncio.wait_for(
+                    application.bot.get_updates(
+                        timeout=2,
+                        limit=1,
+                        allowed_updates=Update.ALL_TYPES
+                    ),
+                    timeout=15
+                )
+
+                if updates:
+                    stale_checks = 0
+                else:
+                    stale_checks += 1
+                    logger.debug(f"🐕 Watchdog: no new updates (stale #{stale_checks})")
+
+                if stale_checks >= 3:
+                    logger.warning("🐕 Watchdog: polling appears stuck — restarting updater")
+                    try:
+                        await updater.stop()
+                    except Exception as stop_err:
+                        logger.warning(f"🐕 Watchdog: updater.stop() failed: {stop_err}")
+                    await asyncio.sleep(2)
+                    try:
+                        await updater.start_polling(
+                            allowed_updates=Update.ALL_TYPES
+                        )
+                        logger.info("🐕 Watchdog: polling restarted successfully")
+                    except Exception as start_err:
+                        logger.error(f"🐕 Watchdog: updater.start_polling() failed: {start_err}")
+                    stale_checks = 0
+
+            except asyncio.TimeoutError:
+                logger.warning("🐕 Watchdog: get_updates timed out — forcing restart")
+                try:
+                    await updater.stop()
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+                try:
+                    await updater.start_polling(
+                        allowed_updates=Update.ALL_TYPES
+                    )
+                    logger.info("🐕 Watchdog: polling recovered after timeout")
+                except Exception as e:
+                    logger.error(f"🐕 Watchdog: recovery failed: {e}")
+                stale_checks = 0
+
+            except Exception as e:
+                logger.warning(f"🐕 Watchdog: get_updates error: {e}")
+                stale_checks += 1
+
+        except asyncio.CancelledError:
+            logger.info("🐕 Watchdog: cancelled")
+            return
         except Exception as e:
-            logger.error(f"Error saving rating: {e}")
+            logger.error(f"🐕 Watchdog unexpected error: {e}")
+            await asyncio.sleep(15)
 
-ai = GroqAI()
 
-# ============================================================================
-# MODEL REFRESH BACKGROUND JOB
-# ============================================================================
-async def refresh_groq_models(context: ContextTypes.DEFAULT_TYPE):
-    """Background job to refresh model list periodically."""
-    logger.info("🔄 [AUTO-REFRESH] Refreshing Groq model list...")
-    success = ai.fetch_available_models()
-    if success:
-        logger.info(f"✅ [AUTO-REFRESH] Models refreshed. Current: {list(ai.base_models.keys())}")
-    else:
-        logger.warning("⚠️ [AUTO-REFRESH] Model refresh failed, keeping previous list")
+# -------------------- DATABASE CLASS --------------------
+class TempMailDB:
+    def __init__(self, db_path=DB_PATH):
+        self.db_path = db_path
+        self.init_db()
 
-# ============================================================================
-# USER MANAGEMENT
-# ============================================================================
-async def get_all_users() -> List[int]:
-    try:
-        with open("users.json", "r") as file:
-            return json.load(file)
-    except:
+    def init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                email TEXT NOT NULL,
+                password TEXT NOT NULL,
+                account_id TEXT NOT NULL,
+                token TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_checked TIMESTAMP,
+                is_active INTEGER DEFAULT 1
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                message_id TEXT NOT NULL,
+                from_address TEXT,
+                subject TEXT,
+                body TEXT,
+                html_body TEXT,
+                received_at TIMESTAMP,
+                is_read INTEGER DEFAULT 0,
+                has_attachments INTEGER DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                UNIQUE(user_id, message_id)
+            )
+        ''')
+
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS attachments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                message_id TEXT,
+                attachment_id TEXT,
+                filename TEXT,
+                mime_type TEXT,
+                size INTEGER,
+                content BLOB,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        ''')
+
+        conn.commit()
+        conn.close()
+        logger.info("✅ Database initialized")
+
+    def create_user(self, user_id, email, password, account_id, token):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT OR REPLACE INTO users 
+                (user_id, email, password, account_id, token, created_at, last_checked)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ''', (user_id, email, password, account_id, token))
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"DB error: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def get_user(self, user_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT user_id, email, password, account_id, token, created_at, last_checked
+            FROM users
+            WHERE user_id = ? AND is_active = 1
+        ''', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        if result:
+            return {
+                'user_id': result[0],
+                'email': result[1],
+                'password': result[2],
+                'account_id': result[3],
+                'token': result[4],
+                'created_at': result[5],
+                'last_checked': result[6]
+            }
+        return None
+
+    def delete_user(self, user_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('UPDATE users SET is_active = 0 WHERE user_id = ?', (user_id,))
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"DB error: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def update_last_checked(self, user_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('UPDATE users SET last_checked = CURRENT_TIMESTAMP WHERE user_id = ?', (user_id,))
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"DB error: {e}")
+        finally:
+            conn.close()
+
+    def save_messages(self, user_id, messages):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            for msg in messages:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO messages 
+                    (user_id, message_id, from_address, subject, received_at, has_attachments)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (
+                    user_id,
+                    msg.get('id'),
+                    msg.get('from', {}).get('address', 'Unknown'),
+                    msg.get('subject', 'No Subject'),
+                    msg.get('createdAt', datetime.now().isoformat()),
+                    1 if msg.get('attachments', []) else 0
+                ))
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"DB error: {e}")
+        finally:
+            conn.close()
+
+    def get_messages(self, user_id, limit=20):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT message_id, from_address, subject, received_at, is_read, has_attachments
+            FROM messages
+            WHERE user_id = ?
+            ORDER BY received_at DESC
+            LIMIT ?
+        ''', (user_id, limit))
+        results = cursor.fetchall()
+        conn.close()
+        return [{
+            'id': row[0],
+            'from': row[1],
+            'subject': row[2],
+            'received_at': row[3],
+            'is_read': row[4],
+            'has_attachments': row[5]
+        } for row in results]
+
+    def get_message_by_id(self, user_id, message_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT message_id, from_address, subject, body, html_body, received_at, has_attachments
+            FROM messages
+            WHERE user_id = ? AND message_id = ?
+        ''', (user_id, message_id))
+        result = cursor.fetchone()
+        conn.close()
+        if result:
+            self.mark_message_read(user_id, message_id)
+            return {
+                'id': result[0],
+                'from': result[1],
+                'subject': result[2],
+                'body': result[3],
+                'html_body': result[4],
+                'received_at': result[5],
+                'has_attachments': result[6]
+            }
+        return None
+
+    def mark_message_read(self, user_id, message_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                UPDATE messages SET is_read = 1
+                WHERE user_id = ? AND message_id = ?
+            ''', (user_id, message_id))
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"DB error: {e}")
+        finally:
+            conn.close()
+
+    def update_message_body(self, user_id, message_id, body, html_body=None):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                UPDATE messages 
+                SET body = ?, html_body = ?
+                WHERE user_id = ? AND message_id = ?
+            ''', (body, html_body, user_id, message_id))
+            conn.commit()
+        except sqlite3.Error as e:
+            logger.error(f"DB error: {e}")
+        finally:
+            conn.close()
+
+    def delete_all_messages(self, user_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('DELETE FROM messages WHERE user_id = ?', (user_id,))
+            conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"DB error: {e}")
+            return False
+        finally:
+            conn.close()
+
+    def get_unread_count(self, user_id):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) FROM messages
+            WHERE user_id = ? AND is_read = 0
+        ''', (user_id,))
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+
+
+db = TempMailDB()
+
+
+# -------------------- MAIL.TM API FUNCTIONS --------------------
+class MailTM:
+    def __init__(self):
+        self.base_url = API_BASE
+        self.session = requests.Session()
+
+    def create_account(self):
+        domains = self.get_domains()
+        if not domains:
+            return None
+
+        domain = domains[0]['domain']
+        username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        email = f"{username}@{domain}"
+        password = ''.join(random.choices(string.ascii_letters + string.digits, k=12))
+
+        response = self.session.post(
+            f"{self.base_url}/accounts",
+            json={"address": email, "password": password}
+        )
+
+        if response.status_code == 201:
+            data = response.json()
+            account_id = data['id']
+            token_response = self.session.post(
+                f"{self.base_url}/token",
+                json={"address": email, "password": password}
+            )
+            if token_response.status_code == 200:
+                token_data = token_response.json()
+                return {
+                    'email': email,
+                    'password': password,
+                    'account_id': account_id,
+                    'token': token_data['token'],
+                    'id': token_data['id']
+                }
+        return None
+
+    def get_domains(self):
+        response = self.session.get(f"{self.base_url}/domains")
+        if response.status_code == 200:
+            data = response.json()
+            return data['hydra:member']
         return []
 
-async def save_user(user_id: int):
-    users = await get_all_users()
-    if user_id not in users:
-        users.append(user_id)
-        with open("users.json", "w") as file:
-            json.dump(users, file)
+    def get_messages(self, token):
+        headers = {'Authorization': f'Bearer {token}'}
+        response = self.session.get(f"{self.base_url}/messages", headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            return data['hydra:member']
+        return []
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    def get_message(self, token, message_id):
+        headers = {'Authorization': f'Bearer {token}'}
+        response = self.session.get(f"{self.base_url}/messages/{message_id}", headers=headers)
+        if response.status_code == 200:
+            return response.json()
+        return None
 
-# ============================================================================
-# FORCE JOIN SYSTEM
-# ============================================================================
-async def check_user_subscription(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool, List[dict]]:
-    not_joined = []
-    for channel in REQUIRED_CHANNELS:
-        username = channel["username"]
-        channel_id = channel.get("id")
-        joined = False
-        
-        if channel_id:
-            try:
-                chat_member = await context.bot.get_chat_member(
-                    chat_id=int(channel_id),
-                    user_id=user_id
-                )
-                if chat_member.status in ["member", "administrator", "creator"]:
-                    joined = True
-            except Exception:
-                pass
-        
-        if not joined:
-            try:
-                chat_member = await context.bot.get_chat_member(
-                    chat_id=f"@{username}",
-                    user_id=user_id
-                )
-                if chat_member.status in ["member", "administrator", "creator"]:
-                    joined = True
-            except Exception:
-                pass
-        
-        if not joined:
-            not_joined.append(channel)
-    
-    return len(not_joined) == 0, not_joined
-
-async def get_join_keyboard(not_joined: List[dict] = None) -> InlineKeyboardMarkup:
-    keyboard = []
-    for channel in REQUIRED_CHANNELS:
-        if not_joined is None or any(c["username"] == channel["username"] for c in not_joined):
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"📢 Join {channel['username']}",
-                    url=channel["link"]
-                )
-            ])
-    keyboard.append([
-        InlineKeyboardButton(
-            "✅ Verify & Activate",
-            callback_data="check_subscription"
+    def delete_message(self, token, message_id):
+        headers = {'Authorization': f'Bearer {token}'}
+        response = self.session.delete(
+            f"{self.base_url}/messages/{message_id}",
+            headers=headers
         )
-    ])
-    return InlineKeyboardMarkup(keyboard)
+        return response.status_code == 204
 
-async def send_force_join_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    first_name = user.first_name if user.first_name else "User"
-    _, not_joined = await check_user_subscription(user.id, context)
-    
-    message = (
-        f"👋 <b>Hello {first_name}! Welcome to NEXUS AI</b>\n\n"
-        f"📢 <b>Please join these channels to activate me:</b>\n\n"
+    def delete_account(self, token, account_id):
+        headers = {'Authorization': f'Bearer {token}'}
+        response = self.session.delete(
+            f"{self.base_url}/accounts/{account_id}",
+            headers=headers
+        )
+        return response.status_code == 204
+
+
+mail_api = MailTM()
+
+
+# -------------------- FORCE JOIN HELPERS (Multi-Channel) --------------------
+async def check_single_channel(context: ContextTypes.DEFAULT_TYPE, channel: str, user_id: int) -> bool:
+    """Return True if user is a member of the given channel."""
+    try:
+        chat = await context.bot.get_chat(channel)
+        member = await context.bot.get_chat_member(chat.id, user_id)
+        return member.status in ["creator", "administrator", "member"]
+    except Exception as e:
+        logger.error(f"Membership check error for {channel}: {e}")
+        return False
+
+
+async def get_missing_channels(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> list:
+    """Return list of channels the user has NOT joined yet."""
+    missing = []
+    for channel, link in FORCE_CHANNELS:
+        if not await check_single_channel(context, channel, user_id):
+            missing.append((channel, link))
+    return missing
+
+
+async def is_user_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """True only if user has joined ALL required channels."""
+    user_id = update.effective_user.id
+    missing = await get_missing_channels(context, user_id)
+    return len(missing) == 0
+
+
+async def send_force_join_message(update: Update, context: ContextTypes.DEFAULT_TYPE, missing: list = None):
+    """Send force-join prompt, showing only the channels the user hasn't joined."""
+    if missing is None:
+        missing = await get_missing_channels(context, update.effective_user.id)
+
+    channel_lines = "\n".join(f"📢 <b>{ch}</b>" for ch, _ in missing)
+
+    text = (
+        "<b>🔒 🔐 CHANNEL ACCESS REQUIRED 🔐 🔒</b>\n\n"
+        "<b>🌟 You need to join our official channels to use this bot!</b> 🌟\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"{channel_lines}\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "<b>✨ Benefits of joining:</b>\n"
+        "• 📧 Get temporary email addresses\n"
+        "• 📬 Receive and read emails\n"
+        "• 🔄 Manage your inbox\n"
+        "• 🚀 24/7 available\n\n"
+        "<b>👇 Click each button below to join, then press VERIFY!</b>"
     )
-    
-    for channel in REQUIRED_CHANNELS:
-        is_joined = not any(c["username"] == channel["username"] for c in not_joined)
-        status = "✅" if is_joined else "❌"
-        message += f"{status} <a href='{channel['link']}'>{channel['username']}</a>\n"
-    
-    message += "\n🔓 <b>Click below to activate!</b>"
-    
-    keyboard = await get_join_keyboard(not_joined)
-    
-    if update.message:
-        await update.message.reply_text(
-            message,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-            disable_web_page_preview=True
-        )
-    elif update.callback_query:
-        await update.callback_query.message.edit_text(
-            message,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-            disable_web_page_preview=True
-        )
 
-async def force_join_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    user_id = update.effective_user.id
-    if is_admin(user_id):
-        return True
-    if user_id in ai.verified_users:
-        if datetime.now() - ai.verified_users[user_id] < timedelta(hours=VERIFICATION_HOURS):
-            return True
-    is_subscribed, _ = await check_user_subscription(user_id, context)
-    if is_subscribed:
-        ai.verified_users[user_id] = datetime.now()
-        return True
-    await send_force_join_message(update, context)
-    return False
+    keyboard_rows = []
+    for channel, link in missing:
+        keyboard_rows.append([InlineKeyboardButton(f"📢 JOIN {channel} 📢", url=link)])
+    keyboard_rows.append([InlineKeyboardButton("✅ I'VE JOINED — VERIFY ✅", callback_data="check_join")])
 
-# ============================================================================
-# MAIN MENU
-# ============================================================================
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, first_time: bool = False):
-    user = update.effective_user
-    first_name = user.first_name if user.first_name else "User"
-    model_name = ai.models[ai.current_model]['name']
-    provider = ai.models[ai.current_model].get('provider', 'Groq')
-    
-    groq_status = "⚠️ Limit Reached" if ai.groq_limit_reached else "✅ Active"
-    
-    if first_time:
-        welcome_text = (
-            f"🎉 <b>Welcome {first_name}!</b>\n\n"
-            f"✨ <b>Nexus AI</b>\n"
-            f"🤖 <b>Using:</b> {model_name}\n"
-            f"🔌 <b>Provider:</b> {provider}\n"
-            f"📊 <b>Groq Status:</b> {groq_status}\n\n"
-            f"💡 <b>I can help you with:</b>\n"
-            f"• Answering questions\n"
-            f"• Creative writing\n"
-            f"• Problem solving\n"
-            f"• Learning new topics\n\n"
-            f"🚀 <b>Let's get started!</b>"
-        )
-    else:
-        welcome_text = (
-            f"👋 <b>Welcome back {first_name}!</b>\n\n"
-            f"🤖 <b>Nexus AI - {model_name}</b>\n"
-            f"🔌 <b>Provider:</b> {provider}\n"
-            f"📊 <b>Groq Status:</b> {groq_status}\n\n"
-            f"📌 <b>What would you like to do?</b>"
-        )
-    
-    keyboard = [
-        [InlineKeyboardButton("💬 Chat", callback_data="chat_mode")],
-        [InlineKeyboardButton("🔧 Select Model", callback_data="model_select")],
-        [InlineKeyboardButton("📚 History", callback_data="history_view")],
-        [InlineKeyboardButton("❓ Help", callback_data="help_menu")]
-    ]
-    if is_admin(user.id):
-        keyboard.append([InlineKeyboardButton("⚙️ Admin", callback_data="admin_panel")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    if update.message:
-        await update.message.reply_text(welcome_text, parse_mode="HTML", reply_markup=reply_markup)
-    elif update.callback_query:
-        await update.callback_query.message.edit_text(welcome_text, parse_mode="HTML", reply_markup=reply_markup)
+    keyboard = InlineKeyboardMarkup(keyboard_rows)
 
-# ============================================================================
-# START COMMAND
-# ============================================================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await save_user(user.id)
-    logger.info(f"👤 User {user.id} started the bot")
-    if not await force_join_check(update, context):
-        return
-    await show_main_menu(update, context, first_time=True)
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
+    elif update.message:
+        await update.message.reply_text(text, reply_markup=keyboard, parse_mode="HTML")
 
-# ============================================================================
-# CLEAR HISTORY COMMAND
-# ============================================================================
-async def clear_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    
-    if not await force_join_check(update, context):
-        return
-    
-    if user_id in ai.user_sessions:
-        ai.user_sessions[user_id] = []
-        await update.message.reply_text(
-            "🧹 <b>Chat history cleared!</b>\n\nYour conversation history has been reset. Let's start fresh! ✨",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Menu", callback_data="main_menu")]])
-        )
-    else:
-        await update.message.reply_text(
-            "ℹ️ <b>No chat history found</b>\n\nYou don't have any conversation history to clear.",
-            parse_mode="HTML"
-        )
 
-# ============================================================================
-# ADMIN COMMANDS
-# ============================================================================
-async def admin_commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_admin(user_id):
-        await update.message.reply_text("⛔ <b>Access denied!</b>", parse_mode="HTML")
-        return
-    
-    cmd = update.message.text[1:] if update.message.text.startswith('/') else ''
-    
-    if cmd == 'stats':
-        users = await get_all_users()
-        await update.message.reply_text(
-            f"📊 <b>Bot Statistics</b>\n\n"
-            f"👥 Total Users: {len(users)}\n"
-            f"🤖 Model: {ai.models[ai.current_model]['name']}\n"
-            f"📊 Groq Status: {'⚠️ Limit Reached' if ai.groq_limit_reached else '✅ Active'}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📊 Full Stats", callback_data="admin_stats")]])
-        )
-    elif cmd == 'users':
-        users = await get_all_users()
-        user_list = "\n".join([f"• <code>{uid}</code>" for uid in users[:20]])
-        await update.message.reply_text(
-            f"👥 <b>Users ({len(users)})</b>\n\n{user_list}",
-            parse_mode="HTML"
-        )
-    elif cmd == 'broadcast':
-        context.user_data['broadcast_step'] = 'media'
-        await update.message.reply_text(
-            "📢 <b>Broadcast Message</b>\n\n"
-            "Send an image (optional) or caption text.\n\n"
-            "📌 <b>Format for buttons:</b>\n"
-            "<code>Text | URL</code> (one per line)\n\n"
-            "📝 <b>Example:</b>\n"
-            "<code>Visit Website | https://example.com</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")]])
-        )
-    elif cmd == 'refresh':
-        await update.message.reply_text("🔄 Refreshing models...", parse_mode="HTML")
-        success = ai.fetch_available_models()
-        if success:
-            await update.message.reply_text(
-                f"✅ <b>Models Refreshed</b>\n\n"
-                f"📋 Available: {', '.join(ai.base_models.keys())}",
-                parse_mode="HTML"
-            )
-        else:
-            await update.message.reply_text(
-                "⚠️ <b>Refresh Failed</b>\n\nCould not fetch models from Groq.",
-                parse_mode="HTML"
-            )
-
-# ============================================================================
-# CALLBACK HANDLER
-# ============================================================================
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def check_join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
-    data = query.data
-    
-    if data == "check_subscription":
-        is_subscribed, not_joined = await check_user_subscription(user_id, context)
-        if is_subscribed:
-            ai.verified_users[user_id] = datetime.now()
-            user = update.effective_user
-            first_name = user.first_name if user.first_name else "User"
-            await query.edit_message_text(
-                f"✅ <b>Verified!</b>\n\n🎉 Thank you {first_name}!\n\n🤖 You can now use Nexus AI.",
-                parse_mode="HTML"
-            )
-            await show_main_menu(update, context, first_time=True)
-        else:
-            message = "📢 <b>Join these channels:</b>\n\n"
-            for channel in REQUIRED_CHANNELS:
-                is_joined = not any(c["username"] == channel["username"] for c in not_joined)
-                status = "✅" if is_joined else "❌"
-                message += f"{status} <a href='{channel['link']}'>{channel['username']}</a>\n"
-            keyboard = await get_join_keyboard(not_joined)
-            await query.edit_message_text(
-                message,
-                parse_mode="HTML",
-                reply_markup=keyboard,
-                disable_web_page_preview=True
-            )
-        return
-    
-    if data.startswith("fallback_model_"):
-        model_key = data.replace("fallback_model_", "")
-        
-        if model_key in ai.models:
-            ai.current_model = model_key
-            model = ai.models[model_key]
-            
-            await query.edit_message_text(
-                f"✅ <b>Switched to {model['name']}</b>\n\n"
-                f"🔌 <b>Provider:</b> {model.get('provider', 'Unknown')}\n"
-                f"📌 <b>Description:</b> {model['description']}\n\n"
-                f"✨ You can now continue chatting with this model!",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Chat", callback_data="chat_mode")]])
-            )
-        return
-    
-    if data == "main_menu":
-        if not await force_join_check(update, context):
-            return
-        await show_main_menu(update, context, first_time=False)
-        return
-    
-    if data == "history_view":
-        if not await force_join_check(update, context):
-            return
-        if user_id not in ai.user_sessions or not ai.user_sessions[user_id]:
-            await query.edit_message_text(
-                "📚 <b>Chat History</b>\n\nYou don't have any chat history yet.\nStart chatting to build your history! 💬",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Menu", callback_data="main_menu")]])
-            )
-            return
-        
-        history = ai.user_sessions[user_id][-10:]
-        history_text = "📚 <b>Your Recent Chat History</b>\n\n"
-        for msg in history:
-            role = "👤 You" if msg["role"] == "user" else "🤖 Nexus AI"
-            content = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
-            history_text += f"<b>{role}:</b> {content}\n\n"
-        
-        await query.edit_message_text(
-            history_text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🧹 Clear History", callback_data="clear_history_confirm")],
-                [InlineKeyboardButton("📋 Menu", callback_data="main_menu")]
-            ])
-        )
-        return
-    
-    if data == "clear_history_confirm":
-        if not await force_join_check(update, context):
-            return
-        if user_id in ai.user_sessions:
-            ai.user_sessions[user_id] = []
-            await query.edit_message_text(
-                "🧹 <b>Chat history cleared!</b>\n\nYour conversation history has been reset. ✨",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Menu", callback_data="main_menu")]])
-            )
-        return
-    
-    if data == "model_select":
-        if not await force_join_check(update, context):
-            return
-        keyboard = []
-        for key, model in ai.models.items():
-            is_current = "✅ " if key == ai.current_model else "  "
-            provider = model.get('provider', 'Groq')
-            keyboard.append([
-                InlineKeyboardButton(
-                    f"{is_current}{model['name']} [{provider}]",
-                    callback_data=f"set_model_{key}"
-                )
-            ])
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-        await query.edit_message_text(
-            f"🔧 <b>Select Model</b>\n\n"
-            f"📌 <b>Current:</b> {ai.models[ai.current_model]['name']}\n"
-            f"🔌 <b>Provider:</b> {ai.models[ai.current_model].get('provider', 'Groq')}\n\n"
-            f"⚡ <b>Choose a model:</b>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    if data.startswith("set_model_"):
-        if not await force_join_check(update, context):
-            return
-        model_key = data.replace("set_model_", "")
-        if model_key in ai.models:
-            ai.current_model = model_key
-            model = ai.models[model_key]
-            await query.edit_message_text(
-                f"✅ <b>Switched to {model['name']}</b>\n\n"
-                f"📌 <b>Description:</b> {model['description']}\n"
-                f"⚡ <b>Speed:</b> {model['speed']}\n"
-                f"📊 <b>Context:</b> {model['context']}\n"
-                f"🔌 <b>Provider:</b> {model.get('provider', 'Groq')}\n\n"
-                f"✨ Model loaded successfully!",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]])
-            )
-        return
-    
-    if data == "chat_mode":
-        if not await force_join_check(update, context):
-            return
-        context.user_data['mode'] = 'chat'
-        model_name = ai.models[ai.current_model]['name']
-        await query.edit_message_text(
-            f"💬 <b>Chat Mode</b>\n\n"
-            f"🤖 <b>Using:</b> {model_name}\n\n"
-            f"✨ <b>Send me any message and I'll reply!</b>\n\n"
-            f"💡 <b>I can help with:</b>\n"
-            f"• Questions & answers\n"
-            f"• Writing & coding\n"
-            f"• Research & learning\n"
-            f"• General tasks\n\n"
-            f"📝 <b>Type your message now</b>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]])
-        )
-        return
-    
-    if data == "help_menu":
-        if not await force_join_check(update, context):
-            return
-        help_text = (
-            f"❓ <b>Help Center</b>\n\n"
-            f"💬 <b>Chat</b>\n"
-            f"Send any text message for intelligent responses\n\n"
-            f"🔧 <b>Model Selection</b>\n"
-            f"Choose from multiple AI models:\n"
-            f"• Groq GPT-OSS models\n"
-            f"• DeepSeek V3.1\n"
-            f"• Drift GPT-OSS\n\n"
-            f"📚 <b>History</b>\n"
-            f"View and clear your conversation history\n\n"
-            f"⚡ <b>Powered by Groq & Drift AI</b>\n"
-            f"Ultra-fast AI responses\n\n"
-            f"💡 <b>Tips</b>\n"
-            f"• Be specific with questions\n"
-            f"• Use clear language\n"
-            f"• Ask follow-up questions\n\n"
-            f"Just type your message! 🚀"
-        )
-        await query.edit_message_text(
-            help_text,
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]])
-        )
-        return
-    
-    if data == "admin_panel":
-        if not is_admin(user_id):
-            await query.edit_message_text("⛔ <b>Access denied!</b>", parse_mode="HTML")
-            return
-        await query.edit_message_text(
-            "⚙️ <b>Admin Panel</b>\n\nSelect an option:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
-                [InlineKeyboardButton("👥 Users", callback_data="admin_users")],
-                [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")],
-                [InlineKeyboardButton("🔄 Refresh Models", callback_data="admin_refresh")],
-                [InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]
-            ])
-        )
-        return
-    
-    if data == "admin_refresh":
-        if not is_admin(user_id):
-            return
-        await query.edit_message_text("🔄 Refreshing models...", parse_mode="HTML")
-        success = ai.fetch_available_models()
-        if success:
-            await query.edit_message_text(
-                f"✅ <b>Models Refreshed</b>\n\n"
-                f"📋 Available: {', '.join(ai.base_models.keys())}",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]])
-            )
-        else:
-            await query.edit_message_text(
-                "⚠️ <b>Refresh Failed</b>\n\nCould not fetch models from Groq.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]])
-            )
-        return
-    
-    if data == "admin_stats":
-        if not is_admin(user_id):
-            return
-        users = await get_all_users()
-        
-        avg_rating = 0
-        try:
-            with open("ratings.json", "r") as f:
-                ratings = [json.loads(line) for line in f if line.strip()]
-                if ratings:
-                    avg_rating = sum(int(r['rating']) for r in ratings) / len(ratings)
-        except:
-            pass
-        
-        model_usage = "\n".join([f"• {ai.models[k]['name']}: {v} uses" for k, v in ai.model_stats.items()])
-        
-        await query.edit_message_text(
-            f"📊 <b>Bot Statistics</b>\n\n"
-            f"👥 Total Users: {len(users)}\n"
-            f"⭐ Avg Rating: {avg_rating:.1f}/5\n"
-            f"🤖 Current Model: {ai.models[ai.current_model]['name']}\n"
-            f"📊 Model Usage:\n{model_usage}\n"
-            f"💓 Keep-Alive: {'✅ Active' if RENDER_EXTERNAL_URL else '❌ Disabled'}\n"
-            f"🔄 Last Model Refresh: {ai.last_model_refresh.strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]])
-        )
-        return
-    
-    if data == "admin_users":
-        if not is_admin(user_id):
-            return
-        users = await get_all_users()
-        if not users:
-            await query.edit_message_text("👥 <b>No users found.</b>", parse_mode="HTML")
-            return
-        user_list = "\n".join([f"• <code>{uid}</code>" for uid in users[:20]])
-        await query.edit_message_text(
-            f"👥 <b>Users ({len(users)})</b>\n\n{user_list}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]])
-        )
-        return
-    
-    if data == "admin_broadcast":
-        if not is_admin(user_id):
-            return
-        context.user_data['broadcast_step'] = 'media'
-        await query.edit_message_text(
-            "📢 <b>Broadcast</b>\n\n"
-            "Send an image (optional) or caption text.\n\n"
-            "📌 <b>Format for buttons:</b>\n"
-            "<code>Text | URL</code> (one per line)",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")]])
-        )
-        return
-    
-    if data == "cancel_broadcast":
-        for k in ['broadcast_step', 'broadcast_image', 'broadcast_caption', 'broadcast_buttons']:
-            context.user_data.pop(k, None)
-        await query.edit_message_text(
-            "❌ <b>Cancelled</b>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]])
-        )
-        return
-    
-    if data == "confirm_broadcast":
-        if not is_admin(user_id):
-            return
-        users = await get_all_users()
-        caption = context.user_data.get('broadcast_caption', '')
-        buttons = context.user_data.get('broadcast_buttons', [])
-        img_data = context.user_data.get('broadcast_image')
-        reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
-        
-        await query.edit_message_text(f"📤 Sending to {len(users)} users...", parse_mode="HTML")
-        success, failed = 0, 0
-        
-        for uid in users:
-            try:
-                if img_data:
-                    img = Image.open(io.BytesIO(img_data))
-                    b = io.BytesIO()
-                    img.save(b, format="PNG")
-                    b.seek(0)
-                    await context.bot.send_photo(
-                        chat_id=uid,
-                        photo=b,
-                        caption=caption,
-                        parse_mode="HTML",
-                        reply_markup=reply_markup
-                    )
-                else:
-                    await context.bot.send_message(
-                        chat_id=uid,
-                        text=caption,
-                        parse_mode="HTML",
-                        reply_markup=reply_markup
-                    )
-                success += 1
-            except Exception as e:
-                failed += 1
-                logger.error(f"Failed {uid}: {e}")
-        
-        for k in ['broadcast_step', 'broadcast_image', 'broadcast_caption', 'broadcast_buttons']:
-            context.user_data.pop(k, None)
-        
-        await query.message.reply_text(
-            f"✅ <b>Broadcast Complete</b>\n\n"
-            f"✅ Success: {success}\n"
-            f"❌ Failed: {failed}",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin", callback_data="admin_panel")]])
-        )
-        return
-    
-    if data == "rate_prompt":
-        if not await force_join_check(update, context):
-            return
-        
-        if user_id not in ai.last_response:
-            await query.edit_message_text(
-                "❌ <b>No response to rate</b>\n\nPlease send a message first, then rate the response.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Menu", callback_data="main_menu")]])
-            )
-            return
-        
-        keyboard = [
-            [
-                InlineKeyboardButton("⭐", callback_data="rate_1"),
-                InlineKeyboardButton("⭐", callback_data="rate_2"),
-                InlineKeyboardButton("⭐", callback_data="rate_3"),
-                InlineKeyboardButton("⭐", callback_data="rate_4"),
-                InlineKeyboardButton("⭐", callback_data="rate_5")
-            ],
-            [InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]
-        ]
-        
-        await query.edit_message_text(
-            "⭐ <b>Rate this response</b>\n\n"
-            "How helpful was this response?\n"
-            "<i>Click a star to rate (1-5)</i>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return
-    
-    if data.startswith("rate_"):
-        if not await force_join_check(update, context):
-            return
-        
-        rating_str = data.replace("rate_", "")
-        
-        if rating_str.isdigit():
-            rating = int(rating_str)
-            
-            if 1 <= rating <= 5:
-                ai.save_rating(user_id, rating)
-                
-                stars = "⭐" * rating
-                await query.edit_message_text(
-                    f"{stars} <b>Thanks for your rating!</b>\n\n"
-                    f"You rated this response {rating} out of 5.\n"
-                    f"Your feedback helps us improve! 🚀",
-                    parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Menu", callback_data="main_menu")]])
-                )
-            else:
-                await query.edit_message_text(
-                    "❌ <b>Invalid rating</b>\n\nPlease choose a rating between 1 and 5.",
-                    parse_mode="HTML",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Menu", callback_data="main_menu")]])
-                )
-        else:
-            await query.edit_message_text(
-                "❌ <b>Invalid rating</b>\n\nPlease try again.",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Menu", callback_data="main_menu")]])
-            )
-        return
-    
-    if data.startswith("regen_"):
-        if not await force_join_check(update, context):
-            return
-        prompt = data.replace("regen_", "")
-        try:
-            await query.edit_message_text("🔄 <b>Regenerating response...</b>", parse_mode="HTML")
-            resp = ai.chat(prompt, user_id)
-            keyboard = [
-                [InlineKeyboardButton("🔄 Regenerate", callback_data=f"regen_{prompt[:30]}")],
-                [InlineKeyboardButton("⭐ Rate", callback_data="rate_prompt")],
-                [InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]
-            ]
-            await query.message.reply_text(
-                resp,
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-        except Exception as e:
-            await query.message.reply_text(f"❌ Error: {str(e)}")
-        return
 
-# ============================================================================
-# MESSAGE HANDLER
-# ============================================================================
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    missing = await get_missing_channels(context, user_id)
+
+    if not missing:
+        await show_main_menu(update, context)
+    else:
+        missing_lines = "\n".join(f"❌ <b>{ch}</b>" for ch, _ in missing)
+        text = (
+            f"<b>❌ ❌ STILL MISSING {len(missing)} CHANNEL(S)</b> ❌ ❌\n\n"
+            "You haven't joined the following yet:\n\n"
+            f"{missing_lines}\n\n"
+            "<b>Steps:</b>\n"
+            "1️⃣ Click each <b>JOIN</b> button below\n"
+            "2️⃣ Join the channel\n"
+            "3️⃣ Come back and click <b>VERIFY</b>\n\n"
+            "<b>━━━━━━━━━━━━━━━━━━━━━━</b>"
+        )
+
+        keyboard_rows = []
+        for channel, link in missing:
+            keyboard_rows.append([InlineKeyboardButton(f"📢 JOIN {channel} 📢", url=link)])
+        keyboard_rows.append([InlineKeyboardButton("✅ I'VE JOINED — VERIFY ✅", callback_data="check_join")])
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard_rows),
+            parse_mode="HTML"
+        )
+
+
+# -------------------- UI HELPERS --------------------
+def get_colorful_main_menu(user_exists=False, unread=0):
+    keyboard = []
+
+    if user_exists:
+        inbox_text = f"📬 CHECK INBOX"
+        if unread > 0:
+            inbox_text += f" 🔴 +{unread}"
+        keyboard.append([InlineKeyboardButton(inbox_text, callback_data="inbox")])
+        keyboard.append([
+            InlineKeyboardButton("🔄 REFRESH 🔄", callback_data="refresh"),
+            InlineKeyboardButton("📝 NEW EMAIL ✨", callback_data="new_email")
+        ])
+        keyboard.append([InlineKeyboardButton("🗑️ DELETE ACCOUNT ❌", callback_data="delete_account")])
+    else:
+        keyboard.append([InlineKeyboardButton("📧 CREATE TEMP EMAIL 🚀", callback_data="create_email")])
+
+    keyboard.append([InlineKeyboardButton("ℹ️ HELP 📖", callback_data="help")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_colorful_back_menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 BACK TO MENU 🏠", callback_data="menu")]
+    ])
+
+
+def get_colorful_inbox_buttons(messages, page=0, total_pages=1):
+    keyboard = []
+
+    for i, msg in enumerate(messages[:10], 1):
+        if msg['is_read']:
+            status = "📖 READ"
+            color = "🔵"
+        else:
+            status = "🆕 NEW"
+            color = "🔴"
+
+        attachment = " 📎" if msg['has_attachments'] else ""
+        subject = msg['subject'][:20] + "..." if len(msg['subject']) > 20 else msg['subject']
+
+        keyboard.append([
+            InlineKeyboardButton(
+                f"{color} {i}. {status} {subject}{attachment}",
+                callback_data=f"read_{msg['id']}"
+            )
+        ])
+
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 0:
+            nav_buttons.append(InlineKeyboardButton("◀️ PREV", callback_data=f"inbox_page_{page-1}"))
+        if page < total_pages - 1:
+            nav_buttons.append(InlineKeyboardButton("NEXT ▶️", callback_data=f"inbox_page_{page+1}"))
+        if nav_buttons:
+            keyboard.append(nav_buttons)
+
+    keyboard.append([
+        InlineKeyboardButton("🔄 REFRESH", callback_data="refresh"),
+        InlineKeyboardButton("🗑️ DELETE ALL", callback_data="delete_all_messages")
+    ])
+    keyboard.append([InlineKeyboardButton("🔙 BACK TO MENU 🏠", callback_data="menu")])
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_confirmation_buttons(action="delete"):
+    if action == "delete":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ YES, DELETE ✅", callback_data="confirm_delete"),
+             InlineKeyboardButton("❌ CANCEL ❌", callback_data="menu")]
+        ])
+    elif action == "new_email":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ YES, CREATE NEW ✅", callback_data="create_email"),
+             InlineKeyboardButton("❌ CANCEL ❌", callback_data="menu")]
+        ])
+
+
+async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    await save_user(user_id)
-    
-    if not await force_join_check(update, context):
+    user = db.get_user(user_id)
+
+    if user:
+        unread = db.get_unread_count(user_id)
+        text = (
+            f"<b>📧 🌟 YOUR TEMP EMAIL</b> 🌟 📧\n\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            f"📌 <b>Email:</b> <code>{user['email']}</code>\n"
+            f"⏰ <b>Created:</b> {user['created_at']}\n"
+            f"📬 <b>Unread:</b> {unread}\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"👇 <b>Choose an option below:</b>"
+        )
+    else:
+        text = (
+            f"<b>📧 🌟 TEMP MAIL BOT</b> 🌟 📧\n\n"
+            f"Create a temporary email address to receive messages anonymously.\n\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            f"🔹 No registration required\n"
+            f"🔹 Valid for 24 hours\n"
+            f"🔹 Delete anytime\n"
+            f"🔹 100% Free\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"👇 <b>Click the button below to get started:</b>"
+        )
+
+    reply_markup = get_colorful_main_menu(
+        user_exists=bool(user),
+        unread=db.get_unread_count(user_id) if user else 0
+    )
+
+    if update.callback_query:
+        query = update.callback_query
+        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+    else:
+        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
+
+
+# -------------------- BOT HANDLERS --------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
         return
-    
-    allowed, msg = ai.check_rate_limit(user_id)
-    if not allowed:
-        await update.message.reply_text(msg, parse_mode="HTML")
+    await show_main_menu(update, context)
+
+
+async def create_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
         return
-    
-    if context.user_data.get('broadcast_step') == 'media':
-        if update.message.photo:
-            photo = update.message.photo[-1]
-            file = await photo.get_file()
-            b = io.BytesIO()
-            await file.download_to_memory(b)
-            context.user_data['broadcast_image'] = b.getvalue()
-            context.user_data['broadcast_step'] = 'caption'
-            await update.message.reply_text("✅ <b>Image received! Send your caption.</b>", parse_mode="HTML")
-        else:
-            context.user_data['broadcast_image'] = None
-            context.user_data['broadcast_step'] = 'caption'
-            await update.message.reply_text(
-                "📝 <b>Send caption text.</b>\n\n📌 To add buttons, use:\n<code>Text | URL</code> (one per line)",
-                parse_mode="HTML"
-            )
-        return
-    
-    if context.user_data.get('broadcast_step') == 'caption' and update.message.text:
-        text = update.message.text
-        lines = text.split('\n')
-        caption_lines, buttons = [], []
-        for line in lines:
-            if '|' in line and line.strip():
-                parts = line.split('|')
-                if len(parts) == 2:
-                    buttons.append([InlineKeyboardButton(parts[0].strip(), url=parts[1].strip())])
-                else:
-                    caption_lines.append(line)
-            else:
-                caption_lines.append(line)
-        context.user_data['broadcast_caption'] = '\n'.join(caption_lines)
-        context.user_data['broadcast_buttons'] = buttons
-        await update.message.reply_text(
-            f"📢 <b>Preview</b>\n\n{context.user_data['broadcast_caption']}\n\nConfirm or cancel the broadcast:",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Confirm", callback_data="confirm_broadcast")],
-                [InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast")]
-            ])
+
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+
+    if db.get_user(user_id):
+        user = db.get_user(user_id)
+        mail_api.delete_account(user['token'], user['account_id'])
+        db.delete_user(user_id)
+
+    await query.edit_message_text(
+        "<b>⏳ ⏳ CREATING YOUR EMAIL...</b> ⏳ ⏳\n\n"
+        "Please wait while we generate your temporary email address.",
+        parse_mode="HTML"
+    )
+
+    account = mail_api.create_account()
+
+    if not account:
+        await query.edit_message_text(
+            "<b>❌ ❌ FAILED TO CREATE EMAIL</b> ❌ ❌\n\n"
+            "Something went wrong. Please try again later.",
+            reply_markup=get_colorful_back_menu(),
+            parse_mode="HTML"
         )
         return
-    
-    msg = update.message.text
-    if not msg:
+
+    db.create_user(
+        user_id,
+        account['email'],
+        account['password'],
+        account['account_id'],
+        account['token']
+    )
+
+    text = (
+        f"<b>✅ ✅ TEMPORARY EMAIL CREATED!</b> ✅ ✅\n\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"📌 <b>Email:</b> <code>{account['email']}</code>\n"
+        f"🔑 <b>Password:</b> <code>{account['password']}</code>\n"
+        f"⏰ <b>Valid for:</b> 24 hours\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        f"<b>⚠️ ⚠️ SAVE YOUR PASSWORD!</b> ⚠️ ⚠️\n"
+        f"You'll need it to access your email.\n\n"
+        f"📋 Copy this email and use it anywhere.\n"
+        f"👇 <b>Check your inbox using the buttons below:</b>"
+    )
+
+    reply_markup = get_colorful_main_menu(user_exists=True, unread=0)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+
+
+async def check_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
         return
-    
-    try:
-        await update.message.reply_chat_action("typing")
-        resp = ai.chat(msg, user_id)
-        
-        keyboard = [
-            [InlineKeyboardButton("🔄 Regenerate", callback_data=f"regen_{msg[:30]}")],
-            [InlineKeyboardButton("⭐ Rate", callback_data="rate_prompt")],
-            [InlineKeyboardButton("🔙 Menu", callback_data="main_menu")]
-        ]
-        
-        if len(resp) > 4096:
-            for i in range(0, len(resp), 4096):
-                await update.message.reply_text(resp[i:i+4096], parse_mode="HTML")
+
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+
+    if not user:
+        await query.edit_message_text(
+            "<b>❌ ❌ NO ACTIVE SESSION</b> ❌ ❌\n\n"
+            "Please create a temporary email first.",
+            reply_markup=get_colorful_back_menu(),
+            parse_mode="HTML"
+        )
+        return
+
+    await query.edit_message_text(
+        "<b>⏳ ⏳ FETCHING MESSAGES...</b> ⏳ ⏳\n\n"
+        "Please wait while we retrieve your emails.",
+        parse_mode="HTML"
+    )
+
+    messages = mail_api.get_messages(user['token'])
+
+    if messages:
+        db.save_messages(user_id, messages)
+
+        for msg in messages[:10]:
+            existing = db.get_message_by_id(user_id, msg['id'])
+            if not existing or not existing.get('body'):
+                full_msg = mail_api.get_message(user['token'], msg['id'])
+                if full_msg:
+                    text_content = full_msg.get('text', '')
+                    html_content = full_msg.get('html', [''])[0] if full_msg.get('html') else None
+
+                    if not text_content and html_content:
+                        text_content = re.sub(r'<[^>]+>', ' ', html_content)
+                        text_content = ' '.join(text_content.split())
+
+                    db.update_message_body(
+                        user_id,
+                        msg['id'],
+                        text_content or 'No text content available',
+                        html_content
+                    )
+
+    db.update_last_checked(user_id)
+    cached_messages = db.get_messages(user_id)
+
+    if not cached_messages:
+        text = (
+            f"<b>📭 📭 INBOX EMPTY</b> 📭 📭\n\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+            f"📌 <b>Email:</b> <code>{user['email']}</code>\n"
+            f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+            f"No messages yet. Wait for someone to send you an email!"
+        )
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 REFRESH 🔄", callback_data="refresh")],
+            [InlineKeyboardButton("🔙 BACK TO MENU 🏠", callback_data="menu")]
+        ])
+
+        await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
+        return
+
+    total_pages = (len(cached_messages) + 9) // 10
+    page = context.user_data.get('inbox_page', 0)
+
+    start_idx = page * 10
+    end_idx = min(start_idx + 10, len(cached_messages))
+    page_messages = cached_messages[start_idx:end_idx]
+
+    text = (
+        f"<b>📬 📬 INBOX ({len(cached_messages)} MESSAGES)</b> 📬 📬\n\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"📌 <b>Email:</b> <code>{user['email']}</code>\n"
+        f"📄 <b>Page {page + 1}/{total_pages}</b>\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+    )
+
+    for i, msg in enumerate(page_messages, start_idx + 1):
+        status = "📖 READ" if msg['is_read'] else "🆕 NEW"
+        attachment = " 📎" if msg['has_attachments'] else ""
+        text += f"{i}. {status} <b>From:</b> {msg['from']}\n"
+        text += f"   <b>Subject:</b> {msg['subject']}{attachment}\n"
+        text += f"   <b>Date:</b> {msg['received_at'][:10]}\n\n"
+
+    if len(cached_messages) > 10:
+        text += f"\n... and {len(cached_messages) - 10} more messages\n"
+
+    reply_markup = get_colorful_inbox_buttons(page_messages, page=page, total_pages=total_pages)
+    await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+
+
+async def inbox_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    page = int(query.data.replace("inbox_page_", ""))
+    context.user_data['inbox_page'] = page
+    await check_inbox(update, context)
+
+
+async def read_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    message_id = query.data.replace("read_", "")
+
+    user = db.get_user(user_id)
+    if not user:
+        await query.edit_message_text(
+            "<b>❌ Session expired.</b> Please create a new email.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📧 CREATE EMAIL 🚀", callback_data="create_email")]
+            ]),
+            parse_mode="HTML"
+        )
+        return
+
+    await query.edit_message_text(
+        "<b>⏳ FETCHING MESSAGE CONTENT...</b>",
+        parse_mode="HTML"
+    )
+
+    msg = db.get_message_by_id(user_id, message_id)
+
+    if not msg or not msg.get('body') or msg.get('body') == 'No text content available':
+        full_msg = mail_api.get_message(user['token'], message_id)
+        if full_msg:
+            text_content = full_msg.get('text', '')
+            html_content = full_msg.get('html', [''])[0] if full_msg.get('html') else None
+
+            if not text_content and html_content:
+                text_content = re.sub(r'<[^>]+>', ' ', html_content)
+                text_content = ' '.join(text_content.split())
+
+            db.update_message_body(
+                user_id,
+                message_id,
+                text_content or 'No text content available',
+                html_content
+            )
+            msg = db.get_message_by_id(user_id, message_id)
+
+    if not msg:
+        await query.edit_message_text(
+            "<b>❌ Message not found.</b>",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 REFRESH", callback_data="refresh")],
+                [InlineKeyboardButton("🔙 BACK TO INBOX", callback_data="inbox")]
+            ]),
+            parse_mode="HTML"
+        )
+        return
+
+    text = (
+        f"<b>📧 📧 MESSAGE DETAILS</b> 📧 📧\n\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        f"📌 <b>From:</b> {msg['from']}\n"
+        f"📝 <b>Subject:</b> {msg['subject']}\n"
+        f"📅 <b>Date:</b> {msg['received_at']}\n"
+        f"<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+    )
+
+    if msg.get('body') and msg['body'] != 'No text content available':
+        body = msg['body'][:3000]
+        body = body.replace('\r\n', '\n').replace('\r', '\n')
+        body = '\n'.join(line.strip() for line in body.split('\n') if line.strip())
+
+        if body:
+            text += f"<b>📝 Message:</b>\n<pre>{body}</pre>"
+            if len(msg['body']) > 3000:
+                text += "\n\n... (message truncated)"
         else:
-            await update.message.reply_text(resp, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-    except Exception as e:
-        logger.error(f"Message handler error: {e}")
-        await update.message.reply_text(f"❌ Error: {str(e)}")
+            text += "<b>📝 Message:</b> (Empty message)"
+    else:
+        text += "<b>📝 Message:</b> (No text content available)"
 
-# ============================================================================
-# ERROR HANDLER
-# ============================================================================
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Update {update} caused error {context.error}")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 REFRESH", callback_data="refresh")],
+        [InlineKeyboardButton("🗑️ DELETE", callback_data=f"delete_msg_{message_id}")],
+        [InlineKeyboardButton("🔙 BACK TO INBOX", callback_data="inbox")],
+        [InlineKeyboardButton("🔙 BACK TO MENU 🏠", callback_data="menu")]
+    ])
 
-# ============================================================================
-# MAIN
-# ============================================================================
+    await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+
+async def delete_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    message_id = query.data.replace("delete_msg_", "")
+
+    user = db.get_user(user_id)
+    if user:
+        mail_api.delete_message(user['token'], message_id)
+        db.delete_all_messages(user_id)
+
+    await query.edit_message_text(
+        "<b>✅ ✅ MESSAGE DELETED!</b> ✅ ✅\n\n"
+        "The message has been removed successfully.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📬 CHECK INBOX", callback_data="inbox")],
+            [InlineKeyboardButton("🔙 BACK TO MENU 🏠", callback_data="menu")]
+        ]),
+        parse_mode="HTML"
+    )
+
+
+async def delete_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    db.delete_all_messages(user_id)
+
+    await query.edit_message_text(
+        "<b>✅ ✅ ALL MESSAGES DELETED!</b> ✅ ✅\n\n"
+        "Your inbox has been cleared.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📬 CHECK INBOX", callback_data="inbox")],
+            [InlineKeyboardButton("🔙 BACK TO MENU 🏠", callback_data="menu")]
+        ]),
+        parse_mode="HTML"
+    )
+
+
+async def refresh_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    await check_inbox(update, context)
+
+
+async def new_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    text = (
+        "<b>⚠️ ⚠️ CREATE NEW EMAIL</b> ⚠️ ⚠️\n\n"
+        "This will delete your current email and create a new one.\n"
+        "All messages will be lost.\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "❓ <b>Are you sure you want to continue?</b>\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>"
+    )
+
+    await query.edit_message_text(text, reply_markup=get_confirmation_buttons("new_email"), parse_mode="HTML")
+
+
+async def delete_account(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    text = (
+        "<b>⚠️ ⚠️ DELETE ACCOUNT</b> ⚠️ ⚠️\n\n"
+        "This will permanently delete your temporary email.\n"
+        "All messages will be lost.\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "❓ <b>Are you sure you want to continue?</b>\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>"
+    )
+
+    await query.edit_message_text(text, reply_markup=get_confirmation_buttons("delete"), parse_mode="HTML")
+
+
+async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+
+    if user:
+        mail_api.delete_account(user['token'], user['account_id'])
+        db.delete_user(user_id)
+
+    await query.edit_message_text(
+        "<b>🗑️ 🗑️ ACCOUNT DELETED</b> 🗑️ 🗑️\n\n"
+        "Your temporary email has been deleted.\n\n"
+        "You can create a new one anytime with /start",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📧 CREATE NEW 🚀", callback_data="create_email")],
+            [InlineKeyboardButton("🔙 BACK TO MENU 🏠", callback_data="menu")]
+        ]),
+        parse_mode="HTML"
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
+        return
+
+    query = update.callback_query
+    await query.answer()
+
+    channels_line = " • ".join(ch for ch, _ in FORCE_CHANNELS)
+
+    text = (
+        "<b>📖 📖 HOW TO USE TEMP MAIL BOT</b> 📖 📖\n\n"
+        "<b>1️⃣ Create Email</b>\n"
+        "   Click 'CREATE TEMP EMAIL' to get a new address\n\n"
+        "<b>2️⃣ Check Inbox</b>\n"
+        "   Click 'CHECK INBOX' to see your messages\n\n"
+        "<b>3️⃣ Read Messages</b>\n"
+        "   Click 'READ' on any message to view it\n\n"
+        "<b>4️⃣ Delete Messages</b>\n"
+        "   Delete individual messages or all at once\n\n"
+        "<b>5️⃣ New Email</b>\n"
+        "   Create a new email address (old one is deleted)\n\n"
+        "<b>6️⃣ Delete Account</b>\n"
+        "   Permanently delete your email account\n\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n"
+        "⏰ <b>Email expires after 24 hours</b>\n"
+        "🔒 <b>All data is stored securely in SQLite database</b>\n"
+        f"📢 <b>Our channels:</b> {channels_line}\n"
+        "<b>━━━━━━━━━━━━━━━━━━━━━━</b>\n\n"
+        "💡 <b>Tip:</b> Use this for temporary registrations!"
+    )
+
+    await query.edit_message_text(
+        text,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 BACK TO MENU 🏠", callback_data="menu")]
+        ]),
+        parse_mode="HTML"
+    )
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
+        return
+
+    query = update.callback_query
+    await query.answer()
+    await show_main_menu(update, context)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_user_member(update, context):
+        await send_force_join_message(update, context)
+        return
+
+    await update.message.reply_text(
+        "<b>Use the buttons below to interact with the bot.</b>\n\n"
+        "Type /start to see the menu.",
+        parse_mode="HTML"
+    )
+
+
+# -------------------- MAIN --------------------
 def main():
-    logger.info("🚀 Starting Nexus AI Bot with HTML formatting...")
-    logger.info(f"📡 Health server: port {os.getenv('PORT', 10000)}")
-    logger.info(f"💓 Keep-alive: {'✅ Enabled' if RENDER_EXTERNAL_URL else '❌ Disabled'}")
-    logger.info(f"📢 Force join channels: {[c['username'] for c in REQUIRED_CHANNELS]}")
-    
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("clear", clear_history))
-    
-    for cmd in ["stats", "users", "broadcast", "refresh"]:
-        app.add_handler(CommandHandler(cmd, admin_commands))
-    
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO, handle_message))
-    app.add_error_handler(error_handler)
-    
-    if app.job_queue:
-        app.job_queue.run_repeating(refresh_groq_models, interval=MODEL_REFRESH_INTERVAL, first=60)
-        logger.info(f"⏰ Model auto-refresh scheduled every {MODEL_REFRESH_INTERVAL}s")
-    
-    logger.info(f"✅ Bot is running with {len(ai.models)} models!")
-    logger.info(f"📋 Available models: {list(ai.models.keys())}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        # ── START HEALTH + SELF-PING FIRST (Star Cards order) ──────
+        start_health_server()
+        threading.Thread(target=_self_ping_thread, daemon=True, name="SelfPing").start()
+        # ─────────────────────────────────────────────────────────────
+
+        application = Application.builder().token(BOT_TOKEN).build()
+
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+        application.add_handler(CallbackQueryHandler(check_join_callback, pattern="^check_join$"))
+        application.add_handler(CallbackQueryHandler(create_email, pattern="^create_email$"))
+        application.add_handler(CallbackQueryHandler(check_inbox, pattern="^inbox$"))
+        application.add_handler(CallbackQueryHandler(refresh_inbox, pattern="^refresh$"))
+        application.add_handler(CallbackQueryHandler(inbox_page, pattern="^inbox_page_"))
+        application.add_handler(CallbackQueryHandler(read_message, pattern="^read_"))
+        application.add_handler(CallbackQueryHandler(delete_message, pattern="^delete_msg_"))
+        application.add_handler(CallbackQueryHandler(delete_all_messages, pattern="^delete_all_messages$"))
+        application.add_handler(CallbackQueryHandler(new_email, pattern="^new_email$"))
+        application.add_handler(CallbackQueryHandler(delete_account, pattern="^delete_account$"))
+        application.add_handler(CallbackQueryHandler(confirm_delete, pattern="^confirm_delete$"))
+        application.add_handler(CallbackQueryHandler(help_command, pattern="^help$"))
+        application.add_handler(CallbackQueryHandler(menu, pattern="^menu$"))
+
+        # ── START POLLING WATCHDOG ───────────────────────────────────
+        async def post_init(app: Application):
+            asyncio.create_task(polling_watchdog(app))
+
+        application.post_init = post_init
+        # ─────────────────────────────────────────────────────────────
+
+        logger.info("🤖 Temp Mail Bot starting...")
+        logger.info(f"📊 Database: {DB_PATH}")
+        logger.info(f"📢 Force join: {', '.join(ch for ch, _ in FORCE_CHANNELS)}")
+        logger.info("✅ Powered by mail.tm API")
+        logger.info("✅ Health check server running")
+        logger.info("✅ Self-ping active (10 min interval)")
+        logger.info("✅ Polling watchdog active (90 sec interval)")
+
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+    except Exception as e:
+        logger.error(f"❌ Failed to start bot: {e}")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
